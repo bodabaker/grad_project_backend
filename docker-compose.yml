@@ -1,0 +1,66 @@
+version: "3.8"
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosq_data:/mosquitto/data
+      - mosq_log:/mosquitto/log
+    restart: unless-stopped
+
+  broker-beacon:
+    image: python:3.11-slim
+    container_name: broker-beacon
+    network_mode: host             # must be host to see/send on your LAN
+    restart: unless-stopped
+    volumes:
+      - ./beacon.py:/app/beacon.py:ro
+    command: ["python", "/app/beacon.py"]
+
+  face-service:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    container_name: face-service
+    devices:
+      - "/dev/video0:/dev/video0"
+    group_add:
+      - "video"
+    environment:
+      - TZ=Etc/UTC
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./persons:/data/persons:ro
+      - ./captures:/data/caps
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=false
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_DEFAULT_LOCALE=en
+      - GENERIC_TIMEZONE=Etc/UTC
+      - TZ=Etc/UTC
+      - N8N_ENCRYPTION_KEY=changeme_super_secret_key
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+volumes:
+  n8n_data:
+  mosq_data:
+  mosq_log:
+
