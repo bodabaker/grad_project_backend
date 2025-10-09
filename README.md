@@ -1,104 +1,165 @@
-# Face Detection Service
+# 🧠 Face Detection + MQTT + n8n Automation Stack
 
-A FastAPI-based microservice for real-time face detection and recognition using a webcam or uploaded images. It leverages `face_recognition` and OpenCV for face detection, and provides a simple web UI for live viewing.
+This project integrates a **Python-based face detection microservice**, a **Mosquitto MQTT broker**, a **discovery beacon**, and an **n8n automation platform** — all running inside Docker. The stack enables automated workflows triggered by face recognition events and MQTT communication with other devices (e.g., ESP32, IoT lights).
 
-## Features
-- Detect faces in images or webcam streams
-- Recognize known persons from a directory of images
-- Annotate and save processed frames
-- REST API endpoints for integration
-- MJPEG live stream endpoint for browser viewing
-- Dockerized for easy deployment
+---
 
-## Requirements
-- Python 3.11+
-- See `requirements.txt` for Python dependencies
-- System dependencies for OpenCV and dlib (see Dockerfile)
+## 🚀 Overview
 
-## Installation
+| Component        | Purpose                                                                 |
+|------------------|-------------------------------------------------------------------------|
+| face-service     | FastAPI container using OpenCV & face_recognition for webcam detection.  |
+| mosquitto        | Lightweight MQTT broker for service communication.                       |
+| broker-beacon    | UDP broadcaster announcing the broker’s IP for device auto-discovery.    |
+| n8n              | Visual automation platform orchestrating workflows via MQTT/API triggers. |
 
+Everything is self-contained and reproducible — no manual setup required.
 
-### 1. Clone the repository
-Clone your repository as usual. No need to change directories; all commands can be run from the project root.
+---
 
+## 🧩 Folder Structure
 
+```
+project-root/
+├── docker-compose.yml
+├── face_service/
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── n8n_data/
+│   └── database.sqlite        # stored & versioned via Git LFS
+├── captures/                  # face snapshots
+├── persons/                   # known people
+├── beacon.py                  # UDP beacon for broker discovery
+├── scripts/
+│   └── n8n-prune.sh           # database cleanup helper
+├── .gitattributes
+└── .gitignore
+```
 
-### 2. No manual dependency or service startup needed
-All dependencies are installed automatically inside the containers. You do not need to install anything on your host system.
-You do not need to start any service manually—just use Docker Compose as described below.
+---
 
+## ⚙️ Prerequisites & Setup
 
+- **Docker** ≥ 24
+- **Docker Compose** ≥ 2
+- **Git** and **Git LFS**
 
-
-### 3. Run with Docker Compose
-Simply run:
+Initialize Git LFS once:
 ```bash
-docker compose up --build -d
+git lfs install
+git lfs track "n8n_data/database.sqlite"
+git add .gitattributes
+git commit -m "Track n8n DB via LFS"
 ```
-This will build and start all containers as defined in `docker-compose.yml`. No other commands or manual service startup are required.
 
-Main services started:
-- **face-service**: FastAPI face detection API (exposes port 8000)
-- **mosquitto**: MQTT broker (exposes port 1883)
-- **broker-beacon**: Python beacon script
-- **n8n**: Workflow automation (exposes port 5678)
-
-## Usage
-
-### 1. Prepare known faces
-Place images of known persons in the `persons/` directory. Each image should contain one face and be named as the person's name (e.g., `alice.jpg`).
-
-### 2. Start the service
+Prepare directories and known faces:
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 8000
+mkdir -p persons captures n8n_data scripts
+# Add images to persons/
+persons/
+├── alice/1.jpg
+├── bob/1.jpg
 ```
 
-### 3. API Endpoints
-
-#### Health Check
-- `GET /healthz`
-
-#### Detect Faces in Uploaded Image
-- `POST /detect-image`
-  - Form fields:
-    - `persons_dir`: Path to known faces directory
-    - `file`: Image file upload
-    - `model`: "hog" (CPU) or "cnn" (GPU, if available)
-    - `tolerance`: Recognition threshold (default: 0.6)
-    - `annotated_out`: Optional path to save annotated image
-
-#### Detect Faces from Webcam
-- `POST /detect-webcam`
-  - Form fields:
-    - `persons_dir`: Path to known faces directory
-    - `webcam`: Webcam index (default: 0)
-    - `model`, `tolerance`, `max_seconds`, `max_frames`, `frame_stride`, `stop_on_first`, `annotated_dir`, `save_all_frames`, `include_timeline`
-
-#### MJPEG Live Stream
-- `GET /stream`
-  - Query params:
-    - `persons_dir`, `webcam`, `model`, `tolerance`, `frame_stride`, `annotated`
-
-#### Web UI
-- `GET /ui`
-  - Simple browser interface for live viewing and controls
-
-## Example
-
-1. Place images in `persons/`:
-   - `persons/alice.jpg`
-   - `persons/bob.jpg`
-2. Start the service
-3. Open [http://localhost:8000/ui](http://localhost:8000/ui) in your browser
-
-## Project Structure
-```
-app.py                # Main FastAPI app
-requirements.txt      # Python dependencies
-Dockerfile            # Container setup
-persons/              # Known faces
-captures/             # Saved frames (optional)
+Build and start all containers:
+```bash
+docker compose up -d --build
 ```
 
-## License
-MIT
+Access services:
+- Face detection API: [http://localhost:8000](http://localhost:8000)
+- n8n automation: [http://localhost:5678](http://localhost:5678)
+- MQTT broker: port 1883
+
+---
+
+## 🤖 Face Detection API
+
+Key endpoints:
+- `GET /healthz` — Service health check
+- `POST /detect-webcam` — Detect faces from webcam, save annotated frames
+- `POST /detect-image` — Detect faces in uploaded image
+- `GET /stream` — MJPEG live stream
+- `GET /ui` — Simple browser interface
+
+Example webcam detection:
+```bash
+curl -X POST http://localhost:8000/detect-webcam \
+  -F persons_dir=/data/persons \
+  -F webcam=0 \
+  -F max_seconds=8 \
+  -F annotated_dir=/data/caps
+```
+
+---
+
+## 💬 MQTT Broker & Beacon
+
+- Mosquitto runs on port 1883, accessible for local and LAN MQTT clients.
+- The beacon (`beacon.py`) broadcasts the broker’s IP and responds to WHO_IS queries for device auto-discovery.
+
+---
+
+## 🧠 Managing n8n Data with Git + Git LFS
+
+All n8n workflows, credentials, users, and executions are stored in `n8n_data/database.sqlite` and versioned via Git LFS. This enables instant backup, sync, and reproducible automation environments.
+
+### Backup & Sync
+Just commit and push as usual. The prune script is automatically run by the pre-commit hook, so you do not need to run it manually.
+```bash
+git add n8n_data/database.sqlite
+git commit -m "Backup latest n8n state"
+git push
+```
+
+### Restore on a New Machine
+```bash
+git clone <your-repo>
+cd <your-repo>
+git lfs install
+git lfs pull
+docker compose up -d --build
+```
+n8n loads with all workflows, credentials, and users intact.
+
+---
+
+## 🧹 Pre-commit Hook Setup for New Users
+
+To ensure the prune script runs automatically before each commit, new users must set up the pre-commit hook after cloning:
+
+```bash
+# Make sure the hook script exists and is executable
+chmod +x .githooks/pre-commit
+# Set the hooks path for your local repo
+git config core.hooksPath .githooks
+```
+
+This only needs to be done once per clone.
+
+---
+
+## 🧱 Maintenance Commands
+
+| Task                  | Command                          |
+|-----------------------|----------------------------------|
+| Start all containers  | docker compose up -d             |
+| Stop all containers   | docker compose down              |
+| View logs             | docker compose logs -f           |
+| Prune n8n DB          | ./scripts/n8n-prune.sh           |
+| Rebuild images        | docker compose build --no-cache  |
+
+---
+
+## 🧩 Summary
+
+You now have a complete system that:
+- Detects faces via face-service
+- Broadcasts broker presence with broker-beacon
+- Syncs data in n8n via Git + LFS
+- Is 100% reproducible and portable
+
+Clone, pull, and run — no setup required 🎯
+
+---

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Only run if DB file exists in this repo
+[ -f "${DB_PATH:-n8n_data/database.sqlite}" ] || exit 0
+
+scripts/n8n-prune.sh
+
+# Optional size note (doesn’t block the commit)
+if command -v python3 >/dev/null 2>&1 && [ -f "${DB_PATH:-n8n_data/database.sqlite}" ]; then
+  MB=$(python3 - <<'PY'
+import os
+s=os.path.getsize("n8n_data/database.sqlite")/(1024*1024)
+print(f"{s:.2f}")
+PY
+)
+  echo "[n8n-prune] DB size after VACUUM: ${MB} MB"
+fi

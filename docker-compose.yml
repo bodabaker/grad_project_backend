@@ -15,8 +15,15 @@ services:
   broker-beacon:
     image: python:3.11-slim
     container_name: broker-beacon
-    network_mode: host             # must be host to see/send on your LAN
+    network_mode: host
     restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1           # flush logs immediately
+      - BEACON_NAME=face-broker
+      - BEACON_PORT=18830
+      - BROKER_PORT=1883
+      # If detection fails, temporarily uncomment and set your host LAN IP:
+      # - BEACON_STATIC_IP=192.168.1.10
     volumes:
       - ./beacon.py:/app/beacon.py:ro
     command: ["python", "/app/beacon.py"]
@@ -50,17 +57,16 @@ services:
       - N8N_DEFAULT_LOCALE=en
       - GENERIC_TIMEZONE=Etc/UTC
       - TZ=Etc/UTC
-      - N8N_ENCRYPTION_KEY=changeme_super_secret_key
+      - N8N_ENCRYPTION_KEY=my_fixed_key_here
+      - N8N_EXECUTIONS_DATA_PRUNE=true
+      - N8N_EXECUTIONS_DATA_MAX_AGE=168  # 7 days
+      - N8N_EXECUTIONS_PRUNE_INTERVAL=60 # prune every hour
     ports:
       - "5678:5678"
     volumes:
-      - n8n_data:/home/node/.n8n
-    depends_on:
-      - mosquitto
+      - ./n8n_data:/home/node/.n8n
     restart: unless-stopped
 
 volumes:
-  n8n_data:
   mosq_data:
   mosq_log:
-
