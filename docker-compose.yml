@@ -1,6 +1,9 @@
 version: "3.8"
 
 services:
+  # --------------------------------------------------
+  # MQTT Broker
+  # --------------------------------------------------
   mosquitto:
     image: eclipse-mosquitto:2
     container_name: mosquitto
@@ -11,34 +14,88 @@ services:
       - mosq_data:/mosquitto/data
       - mosq_log:/mosquitto/log
     restart: unless-stopped
+    networks:
+      - video_net   # <-- attach to same network as face-service
 
+  # --------------------------------------------------
+  # Beacon Service (host network)
+  # --------------------------------------------------
   broker-beacon:
     image: python:3.11-slim
     container_name: broker-beacon
     network_mode: host
     restart: unless-stopped
     environment:
-      - PYTHONUNBUFFERED=1           # flush logs immediately
+      - PYTHONUNBUFFERED=1
       - BEACON_NAME=face-broker
       - BEACON_PORT=18830
       - BROKER_PORT=1883
-      # If detection fails, temporarily uncomment and set your host LAN IP:
       # - BEACON_STATIC_IP=192.168.1.10
     volumes:
       - ./beacon.py:/app/beacon.py:ro
     command: ["python", "/app/beacon.py"]
 
+  # --------------------------------------------------
+  # MediaMTX (RTSP / RTMP / HLS / WebRTC) Server
+  # --------------------------------------------------
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx
+    restart: unless-stopped
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    ports:
+      - "8554:8554"   # RTSP
+      - "1935:1935"   # RTMP
+      - "8888:8888"   # HLS
+      - "8889:8889"   # WebRTC
+    networks:
+      - video_net
+
+  # --------------------------------------------------
+  # Camera Publisher (captures webcam and publishes to RTSP)
+  # --------------------------------------------------
+  camera-publisher:
+    image: jrottenberg/ffmpeg:6.1-ubuntu
+    container_name: camera-publisher
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    devices:
+      - "/dev/video0:/dev/video0"    # adjust if your camera index differs
+      - "/dev/dri:/dev/dri"
+    group_add:
+      - "video"
+    # privileged: true               # uncomment temporarily if /dev/video0 perms fail
+    environment:
+      CAM_DEVICE: /dev/video0
+      CAM_SIZE: 1280x720
+      CAM_FPS: "30"
+      ENCODER: libx264               # on Raspberry Pi/ARM: h264_v4l2m2m
+      BITRATE: 2500k
+      RTSP_URL: rtsp://mediamtx:8554/cam?publish=true
+    volumes:
+      - ./camera_publish.sh:/app/publish.sh:ro
+    networks:
+      - video_net
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["exec sh /app/publish.sh"]
+
+  # --------------------------------------------------
+  # Face Recognition Service (consumer of RTSP)
+  # --------------------------------------------------
   face-service:
     build:
       context: ./
       dockerfile: Dockerfile
     container_name: face-service
-    devices:
-      - "/dev/video0:/dev/video0"
     group_add:
       - "video"
     environment:
       - TZ=Etc/UTC
+      - CAMERA_URL=rtsp://mediamtx:8554/cam
+      - MQTT_BROKER=mosquitto         # reachable now via Docker DNS
+      - MQTT_PORT=1883
     ports:
       - "8000:8000"
     volumes:
@@ -46,8 +103,14 @@ services:
       - ./captures:/data/caps
     depends_on:
       - mosquitto
+      - mediamtx
     restart: unless-stopped
+    networks:
+      - video_net
 
+  # --------------------------------------------------
+  # n8n Automation Server
+  # --------------------------------------------------
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
@@ -59,14 +122,25 @@ services:
       - TZ=Etc/UTC
       - N8N_ENCRYPTION_KEY=my_fixed_key_here
       - N8N_EXECUTIONS_DATA_PRUNE=true
-      - N8N_EXECUTIONS_DATA_MAX_AGE=168  # 7 days
-      - N8N_EXECUTIONS_PRUNE_INTERVAL=60 # prune every hour
+      - N8N_EXECUTIONS_DATA_MAX_AGE=168
+      - N8N_EXECUTIONS_PRUNE_INTERVAL=60
+      - N8N_ENDPOINT_WEBHOOK=api
     ports:
       - "5678:5678"
     volumes:
       - ./n8n_data:/home/node/.n8n
     restart: unless-stopped
+    networks:
+      - video_net
+
+# --------------------------------------------------
+# Networks & Volumes
+# --------------------------------------------------
+networks:
+  video_net:
+    driver: bridge
 
 volumes:
   mosq_data:
   mosq_log:
+

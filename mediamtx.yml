@@ -1,0 +1,15 @@
+# minimal example enabling multiple protocols
+rtsp: yes
+rtmp: yes
+hls: yes
+webrtc: yes
+
+# Optional auth per path
+paths:
+  cam:
+    # To require auth for publishers/players uncomment:
+    # publishUser: pub
+    # publishPass: pubpass
+    # readUser: viewer
+    # readPass: viewerpass
+

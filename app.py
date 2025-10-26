@@ -1,4 +1,3 @@
-
 import os
 import time
 from typing import List, Optional, Dict, Any
@@ -8,12 +7,37 @@ from collections import defaultdict
 import cv2
 import numpy as np
 import face_recognition
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, Response, Query
+from fastapi.responses import JSONResponse, HTMLResponse
+from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="Face Detection Service", version="1.0.0")
 
 SUPPORTED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def is_url_like(s: str) -> bool:
+    s = s or ""
+    return s.startswith(("rtsp://", "rtsps://", "http://", "https://", "rtmp://", "rtmps://"))
+
+def open_capture(source: Optional[str], fallback_index: int = 0) -> cv2.VideoCapture:
+    """
+    Open a camera/stream. If `source` looks like a URL, use FFMPEG backend.
+    Else treat it as an integer webcam index (or use `fallback_index`).
+    """
+    if source and is_url_like(source):
+        # For network streams (RTSP/HLS/HTTP), FFMPEG is the most robust backend
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        return cap
+    # If source is given but not URL, try parsing as int; else fallback to index
+    try:
+        index = int(source) if source is not None else int(fallback_index)
+    except ValueError:
+        index = int(fallback_index)
+    cap = cv2.VideoCapture(index)
+    return cap
 
 def load_known_encodings(persons_dir: Path, model: str = "hog"):
     encodings = []
@@ -84,6 +108,9 @@ def ensure_dir(p: Optional[str]) -> Optional[Path]:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+# -----------------------------
+# Endpoints
+# -----------------------------
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -129,6 +156,8 @@ async def detect_image(
 @app.post("/detect-webcam")
 async def detect_webcam(
     persons_dir: str = Form(...),
+    # NEW: allow passing a stream URL; falls back to webcam index if not provided
+    camera_url: Optional[str] = Form(None, description="e.g. rtsp://mediamtx:8554/cam"),
     webcam: int = Form(0),
     model: str = Form("hog"),
     tolerance: float = Form(0.6),
@@ -140,14 +169,22 @@ async def detect_webcam(
     save_all_frames: bool = Form(False),
     include_timeline: bool = Form(False),
 ):
+    # If not provided, try environment variable
+    camera_url = camera_url or os.getenv("CAMERA_URL")
+
     try:
         known_encodings, known_labels = load_known_encodings(Path(persons_dir), model=model)
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": f"Failed loading persons-dir: {e}", "persons_dir": persons_dir})
 
-    cap = cv2.VideoCapture(int(webcam))
+    cap = open_capture(camera_url, fallback_index=webcam)
     if not cap.isOpened():
-        return JSONResponse(status_code=500, content={"error": f"Cannot open webcam index {webcam}"})
+        which = camera_url if (camera_url and is_url_like(camera_url)) else f"index {webcam}"
+        return JSONResponse(status_code=500, content={"error": f"Cannot open capture ({which})"})
+
+    # Optional RTSP/HLS tuning (best effort; ignored by some backends):
+    # Reduce internal buffering for lower latency on RTSP:
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     annotated_path = ensure_dir(annotated_dir)
     t0 = time.time()
@@ -164,8 +201,10 @@ async def detect_webcam(
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
-                if time.time() - t0 > 1.0:
+                # small wait to avoid busy loop on transient failure
+                if max_seconds and time.time() >= deadline:
                     break
+                time.sleep(0.01)
                 continue
 
             frame_id += 1
@@ -201,8 +240,8 @@ async def detect_webcam(
 
     known_only_counts = {k: v for k, v in match_counts.items() if k != "Unknown"}
     summary = {
-        "mode": "webcam",
-        "webcam_index": int(webcam),
+        "mode": "stream" if (camera_url and is_url_like(camera_url)) else "webcam",
+        "source": camera_url or f"index {int(webcam)}",
         "persons_dir": persons_dir,
         "model": model,
         "tolerance": tolerance,
@@ -222,43 +261,48 @@ async def detect_webcam(
         summary["timeline"] = detections_over_time
     return summary
 
-
-from fastapi import Response, Query
-from fastapi.responses import HTMLResponse
-from starlette.concurrency import run_in_threadpool
-
-def mjpeg_generator(persons_dir: str, webcam: int, model: str, tolerance: float,
-                    frame_stride: int, annotated: bool):
+# -----------------------------
+# MJPEG streaming endpoint
+# -----------------------------
+def mjpeg_generator(persons_dir: str,
+                    source: Optional[str],
+                    webcam_index: int,
+                    model: str,
+                    tolerance: float,
+                    frame_stride: int,
+                    annotated: bool):
     # Load encodings once
     known_encodings, known_labels = load_known_encodings(Path(persons_dir), model=model)
 
-    cap = cv2.VideoCapture(int(webcam))
+    cap = open_capture(source, fallback_index=webcam_index)
     if not cap.isOpened():
         # Yield a single frame with error text
+        msg = f"Cannot open capture ({source if (source and is_url_like(source)) else f'index {webcam_index}'})"
         error_canvas = np.zeros((240, 640, 3), dtype=np.uint8)
-        cv2.putText(error_canvas, f"Cannot open webcam {webcam}", (10, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(error_canvas, msg, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         ret, buf = cv2.imencode(".jpg", error_canvas)
         frame = buf.tobytes()
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
         return
+
+    # Reduce buffer for lower latency (best effort)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     frame_id = 0
     try:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
-                # brief placeholder
                 placeholder = np.zeros((240, 640, 3), dtype=np.uint8)
                 cv2.putText(placeholder, "No frame", (10, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 ret, buf = cv2.imencode(".jpg", placeholder)
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+                time.sleep(0.02)
                 continue
 
             frame_id += 1
             if frame_id % max(1, frame_stride) != 0:
-                # Still show raw frame for smoothness
                 view = frame
             else:
                 results, boxes_xyxy, labels_for_draw = detect_on_frame(
@@ -269,26 +313,28 @@ def mjpeg_generator(persons_dir: str, webcam: int, model: str, tolerance: float,
             ret, buf = cv2.imencode(".jpg", view)
             if not ret:
                 continue
-            frame = buf.tobytes()
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            out = buf.tobytes()
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + out + b"\r\n")
     finally:
         cap.release()
 
 @app.get("/stream")
 async def stream(
     persons_dir: str = Query(..., description="Directory with known faces inside the container, e.g. /data/persons"),
+    camera_url: Optional[str] = Query(None, description="e.g. rtsp://mediamtx:8554/cam"),
     webcam: int = Query(0),
     model: str = Query("hog"),
     tolerance: float = Query(0.6),
     frame_stride: int = Query(5),
     annotated: bool = Query(True, description="Draw boxes and labels on stream")
 ):
-    gen = mjpeg_generator(persons_dir, webcam, model, tolerance, frame_stride, annotated)
+    # If not provided, try environment
+    camera_url = camera_url or os.getenv("CAMERA_URL")
+    gen = mjpeg_generator(persons_dir, camera_url, webcam, model, tolerance, frame_stride, annotated)
     return Response(gen, media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/ui", response_class=HTMLResponse)
 async def ui():
-    # Lightweight viewer page that hits /stream with query params
     html = """
     <!DOCTYPE html>
     <html lang="en">
@@ -308,7 +354,8 @@ async def ui():
       <h2>Face Service Live View</h2>
       <div class="controls">
         <label>Persons dir <input id="persons" type="text" value="/data/persons" size="24"></label>
-        <label>Webcam <input id="cam" type="number" value="0" style="width:5em"></label>
+        <label>Source URL <input id="url" type="text" value="rtsp://mediamtx:8554/cam" size="30"></label>
+        <label>Webcam idx <input id="cam" type="number" value="0" style="width:5em"></label>
         <label>Model
           <select id="model">
             <option value="hog" selected>hog (CPU)</option>
@@ -328,16 +375,23 @@ async def ui():
         const img = document.getElementById('view');
         btn.onclick = () => {
           const persons = document.getElementById('persons').value;
+          const url = document.getElementById('url').value;
           const cam = document.getElementById('cam').value;
           const model = document.getElementById('model').value;
           const tol = document.getElementById('tol').value;
           const stride = document.getElementById('stride').value;
           const ann = document.getElementById('ann').checked;
-          const url = `/stream?persons_dir=${encodeURIComponent(persons)}&webcam=${cam}&model=${model}&tolerance=${tol}&frame_stride=${stride}&annotated=${ann}`;
-          img.src = url;
+          const q = new URLSearchParams({
+            persons_dir: persons,
+            camera_url: url,
+            webcam: cam,
+            model, tolerance: tol, frame_stride: stride, annotated: ann
+          });
+          img.src = '/stream?' + q.toString();
         };
       </script>
     </body>
     </html>
     """
     return HTMLResponse(content=html, status_code=200)
+
