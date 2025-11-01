@@ -1,15 +1,25 @@
-# minimal example enabling multiple protocols
-rtsp: yes
-rtmp: yes
-hls: yes
-webrtc: yes
+# Protocol settings
+rtspAddress: :8554
+rtmpAddress: :1935
+hlsAddress: :8888
+webrtcAddress: :8889
 
-# Optional auth per path
+# Low latency settings
+readTimeout: 10s
+writeTimeout: 10s
+
+# Paths configuration
 paths:
   cam:
-    # To require auth for publishers/players uncomment:
-    # publishUser: pub
-    # publishPass: pubpass
-    # readUser: viewer
-    # readPass: viewerpass
+    # No authentication required
+    publishUser: ''
+    publishPass: ''
+    readUser: ''
+    readPass: ''
+    # Source configuration
+    source: publisher
+    # Low latency settings
+    sourceProtocol: tcp
+    sourceOnDemand: no
+    rtspTransport: tcp
 

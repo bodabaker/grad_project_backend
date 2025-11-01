@@ -70,10 +70,10 @@ services:
     environment:
       CAM_DEVICE: /dev/video0
       CAM_SIZE: 1280x720
-      CAM_FPS: "30"
-      ENCODER: libx264               # on Raspberry Pi/ARM: h264_v4l2m2m
-      BITRATE: 2500k
-      RTSP_URL: rtsp://mediamtx:8554/cam?publish=true
+      CAM_FPS: "10"               # Match camera's native FPS
+      ENCODER: libx264           # on Raspberry Pi/ARM: h264_v4l2m2m
+      BITRATE: 1500k            # Lower bitrate for less latency
+      RTSP_URL: rtsp://mediamtx:8554/cam
     volumes:
       - ./camera_publish.sh:/app/publish.sh:ro
     networks:
@@ -104,6 +104,7 @@ services:
     depends_on:
       - mosquitto
       - mediamtx
+      - camera-publisher
     restart: unless-stopped
     networks:
       - video_net

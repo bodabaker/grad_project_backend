@@ -129,10 +129,13 @@ Key endpoints:
 Example webcam detection:
 ```bash
 curl -X POST http://localhost:8000/detect-webcam \
-  -F persons_dir=/data/persons \
-  -F webcam=0 \
-  -F max_seconds=8 \
-  -F annotated_dir=/data/caps
+-F persons_dir=/data/persons \
+-F stop_on_first=true \
+-F max_seconds=10 \
+-F annotated_dir=/data/caps \
+-F frame_stride=3 \
+-F tolerance=0.6 \
+-F model=hog
 ```
 
 ## 📸 [PRIVATE] Camera Stream API
