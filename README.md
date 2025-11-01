@@ -133,7 +133,7 @@ curl -X POST http://localhost:8000/detect-webcam \
 -F stop_on_first=true \
 -F max_seconds=10 \
 -F annotated_dir=/data/caps \
--F frame_stride=3 \
+-F frame_stride=1 \
 -F tolerance=0.6 \
 -F model=hog
 ```
