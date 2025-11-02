@@ -1,0 +1,2 @@
+{"__type":"$$EventMessageAudit","id":"1075338a-a894-4638-ba71-d2dc03d09147","ts":"2025-11-02T04:44:02.974+00:00","eventName":"n8n.audit.workflow.created","message":"n8n.audit.workflow.created","payload":{"userId":"7e0c9b4f-19bc-4d33-bab4-29a3af700c1c","_email":"admin@admin.com","_firstName":"admin","_lastName":"admin","globalRole":"global:owner","workflowId":"aj4hIQCAVKLq1C1t","workflowName":"AI Agent"}}
+{"__type":"$$EventMessageConfirm","confirm":"1075338a-a894-4638-ba71-d2dc03d09147","ts":"2025-11-02T04:44:02.974+00:00","source":{"id":"0","name":"eventBus"}}

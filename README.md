@@ -94,6 +94,7 @@ Internal docker services:
 Key api URLs (base: `http://<HOST IP>:5678`):
 - `/api/camera-feed` - [Get] — Redirects to docker container that streams camera feed
 - `/api/door` - [POST] — Broadcasts MQTT message to open door
+- `/api/agent` - [POST] => json_params: sessionId, message — Interact with AI and recieve streamed output
 ---
 
 ## n8n Workflows
