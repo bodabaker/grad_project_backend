@@ -130,6 +130,9 @@ services:
       - "5678:5678"
     volumes:
       - ./n8n_data:/home/node/.n8n
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     restart: unless-stopped
     networks:
       - video_net
@@ -144,4 +147,3 @@ networks:
 volumes:
   mosq_data:
   mosq_log:
-
