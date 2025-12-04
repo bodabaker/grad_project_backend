@@ -119,6 +119,7 @@ Key api URLs (base: `http://<HOST IP>:5678`):
 - `/api/camera-feed` - [Get] — Redirects to docker container that streams camera feed
 - `/api/door` - [POST] — Broadcasts MQTT message to open door
 - `/api/agent` - [POST] => json_params: sessionId, message — Interact with AI and recieve streamed output
+- `/api/voice` - [POST] — Send an audio file and receive an audio reply from the AI agent
 ---
 
 ## n8n Workflows
