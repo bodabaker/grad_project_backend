@@ -72,9 +72,31 @@ persons/
 ├── bob.jpg
 ```
 
+### Faster-Whisper model (not committed to Git)
+The ASR container mounts a local CTranslate2 Whisper checkpoint from `./models/whisper-medium` (see `asr-fastwhisper` service in `docker-compose.yml`). The model is ~1.4GB, so it's gitignored. Download it once on each machine:
+```bash
+mkdir -p models
+git lfs install                         # ensures large files pull correctly
+git clone https://huggingface.co/guillaumekln/whisper-medium-ct2 models/whisper-medium
+# optional: set WHISPER_DEVICE=cuda in docker-compose.yml if you have an NVIDIA GPU
+```
+
 Build and start all containers:
 ```bash
 docker compose up -d --build
+```
+
+### LLM (Ollama) model
+The stack uses the instruction-tuned Qwen 2.5 7B model. Pull it inside the running `ollama` container (it persists in the `aiot_ollama_data` volume):
+```bash
+docker compose up -d ollama
+docker compose exec ollama ollama pull qwen2.5:7b-instruct
+docker compose exec ollama ollama list  # should show qwen2.5:7b-instruct
+```
+Quick sanity test:
+```bash
+curl -s http://localhost:11434/api/generate \
+  -d '{"model":"qwen2.5:7b-instruct","prompt":"1+1=","stream":false}'
 ```
 
 Internal docker services:
@@ -86,6 +108,8 @@ Internal docker services:
   - RTMP: port 1935
   - HLS: port 8888
   - WebRTC: port 8889
+- Piper TTS (Arabic, Kareem medium): port 5000
+- Ollama (LLM host): port 11434
 ---
 
 
@@ -156,6 +180,25 @@ Access methods:
 
 - Mosquitto runs on port 1883, accessible for local and LAN MQTT clients.
 - The beacon (`beacon.py`) broadcasts the broker’s IP and responds to WHO_IS queries for device auto-discovery.
+
+---
+
+## 🔊 Piper Arabic TTS (HTTP)
+
+- Service: `piper` container (voice: `ar_JO-kareem-medium`, sample rate 22050 Hz).
+- Port: `5000` (HTTP).
+ - Model files are mounted from `voices/ar_JO-kareem-medium/` (contains `model.onnx` and `model.json`).
+ - Image is built locally from `piper-image/Dockerfile` (expects `piper-image/piper_amd64.tar.gz` pre-downloaded from https://github.com/rhasspy/piper/releases/tag/v1.2.0; override via build-arg `PIPER_TARBALL` if you name it differently).
+ - The container runs a small FastAPI wrapper that shells out to the Piper binary bundled in the tarball.
+
+Test synthesis:
+```bash
+curl -X POST http://localhost:5000/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{"text": "مرحبا، أنا كريم وسوف أقرأ هذه الجملة."}' \
+  --output output/piper_ar.wav
+# plays a WAV using the Kareem voice
+```
 
 ---
 

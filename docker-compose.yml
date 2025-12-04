@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # --------------------------------------------------
   # MQTT Broker
@@ -137,13 +135,107 @@ services:
     networks:
       - video_net
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    # If you have NVIDIA drivers + container toolkit installed, uncomment:
+    gpus: all
+    environment:
+      - OLLAMA_NUM_GPU=1        # safe default on RTX 3050; remove if CPU-only
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"           # Ollama HTTP API
+    restart: unless-stopped
+    networks:
+      - video_net
+
+  # =========================
+  # TTS: Piper (HTTP server)
+  # =========================
+  # tts-piper:
+  #   build:
+  #     context: ./tts_piper
+  #     dockerfile: Dockerfile
+  #     args:
+  #       # Supply valid URLs at build time (see step 2)
+  #       PIPER_URL: ""
+  #       VOICE_URL: ""
+  #   container_name: tts-piper
+  #   environment:
+  #     - TTS_PORT=5002
+  #     - PIPER_MODEL=/opt/piper/voices/voice.onnx
+  #     - PIPER_SAMPLE_RATE=22050        # match your voice model
+  #   volumes:
+  #     - piper_voices:/opt/piper/voices
+  #   ports:
+  #     - "5002:5002"
+  #   networks:
+  #     - video_net
+  #   restart: unless-stopped
+
+# --- append in your docker-compose.yml ---
+
+  # --------------------------------------------------
+  # TTS: Fish Speech (HTTP inference server)
+  # --------------------------------------------------
+  piper:
+    build:
+      context: ./piper-image
+      dockerfile: Dockerfile
+    container_name: piper
+    restart: unless-stopped
+    command:
+      - "--port"
+      - "5000"
+    environment:
+      - PIPER_MODEL=/app/models/ar_JO-kareem-medium/model.onnx
+      - PIPER_CONFIG=/app/models/ar_JO-kareem-medium/model.json
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./voices/ar_JO-kareem-medium:/app/models/ar_JO-kareem-medium:ro
+    networks:
+      - video_net
+
+  # ==============================
+  # ASR: Faster-Whisper (HTTP)
+  # ==============================
+  asr-fastwhisper:
+    build:
+      context: ./asr_fasterwhisper
+      dockerfile: Dockerfile
+    container_name: asr-fastwhisper
+    environment:
+      - ASR_PORT=5003
+      - WHISPER_MODEL=/models/whisper-medium  # local model path (see instructions)
+      - WHISPER_DEVICE=cpu            # set to cuda if you enable GPU
+      - WHISPER_COMPUTE=float32       # cuda: float16; cpu: int8_float32/float32
+      - VAD_FILTER=true               # simple VAD trimming
+    volumes:
+      - ./models/whisper-medium:/models/whisper-medium:ro
+    # Uncomment for NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: ["gpu"]
+    # gpus: all
+    ports:
+      - "5003:5003"
+    networks:
+      - video_net
+    restart: unless-stopped
+
+volumes:
+  mosq_data:
+  mosq_log:
+  ollama_data:
+  piper_voices:
+
 # --------------------------------------------------
 # Networks & Volumes
 # --------------------------------------------------
 networks:
   video_net:
     driver: bridge
-
-volumes:
-  mosq_data:
-  mosq_log:
