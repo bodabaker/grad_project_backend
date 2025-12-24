@@ -124,6 +124,7 @@ services:
       - N8N_EXECUTIONS_DATA_MAX_AGE=168
       - N8N_EXECUTIONS_PRUNE_INTERVAL=60
       - N8N_ENDPOINT_WEBHOOK=api
+      - NODE_FUNCTION_ALLOW_EXTERNAL=langchain,langchain/*,@langchain/*
     ports:
       - "5678:5678"
     volumes:
@@ -135,18 +136,79 @@ services:
     networks:
       - video_net
 
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: ollama
+  #   # If you have NVIDIA drivers + container toolkit installed, uncomment:
+  #   gpus: all
+  #   environment:
+  #     - OLLAMA_NUM_GPU=1        # safe default on RTX 3050; remove if CPU-only
+  #   volumes:
+  #     - ./llm/arabic-only.gbnf:/arabic-only.gbnf
+  #     - ./llm/Modelfile:/Modelfile
+  #     - ollama_data:/root/.ollama
+  #   ports:
+  #     - "11434:11434"           # Ollama HTTP API
+  #   restart: unless-stopped
+  #   networks:
+  #     - video_net
+
+  # ollama:
+  #   build: ./llm
+  #   container_name: llm
+  #   restart: unless-stopped
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - capabilities: [gpu]
+  #   environment:
+  #     - OLLAMA_API_OPENAI=1
+  #   ports:
+  #     - "11434:11434"
+  #   networks:
+  #     - video_net
+
   ollama:
-    image: ollama/ollama:latest
+    # Note: Official image is usually under 'ggerganov', not 'ggml-org'
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
     container_name: ollama
-    # If you have NVIDIA drivers + container toolkit installed, uncomment:
-    gpus: all
-    environment:
-      - OLLAMA_NUM_GPU=1        # safe default on RTX 3050; remove if CPU-only
-    volumes:
-      - ollama_data:/root/.ollama
     ports:
-      - "11434:11434"           # Ollama HTTP API
-    restart: unless-stopped
+      - "8080:8080"
+    volumes:
+      - ./llama/models:/models
+      - ./llama/grammars:/grammars
+    
+    # REQUIRED for 'server-cuda' to actually see your GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    command:
+      - "-m"
+      - "/models/qwen25-7b-instruct.Q4_K_M.gguf"
+      # - "-m"
+      # - "/models/Yehia-7B-preview.Q4_K_M.gguf"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--ctx-size"
+      - "4096"
+      - "--threads"
+      - "8"
+      - "--flash-attn"
+      - "on"
+      - "--verbose"
+      - "--grammar-file"
+      - "/grammars/arabic-only.gbnf"
+      # - "--parallel"
+      # - "1"
+
     networks:
       - video_net
 

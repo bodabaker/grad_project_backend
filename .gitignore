@@ -4,3 +4,6 @@ captures/*
 n8n_data/crash.journal
 arabic-*
 models/whisper-medium/
+yehia7b*
+llm/*
+llama/*
