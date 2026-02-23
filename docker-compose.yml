@@ -260,6 +260,34 @@ services:
     networks:
       - video_net
 
+  # --------------------------------------------------
+  # TTS: Fish Audio (HTTP inference server)
+  # --------------------------------------------------
+  fish-speech:
+    image: fishaudio/fish-speech:latest-server-cuda
+    container_name: fish-speech
+    restart: unless-stopped
+    ports:
+      - "8085:8080"          # Fish Audio API server
+    command: ["--half", "--workers", "1"]
+    volumes:
+      - ./fish-speech/checkpoints:/app/checkpoints
+      - ./fish-speech/references:/app/references
+    environment:
+      - COMPILE=0                                                  # Keep torch.compile off
+      - LLAMA_CHECKPOINT_PATH=checkpoints/openaudio-s1-mini        # Path to model weights
+      - DECODER_CHECKPOINT_PATH=checkpoints/openaudio-s1-mini/codec.pth
+      - DECODER_CONFIG_NAME=modded_dac_vq
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - video_net
+
   # ==============================
   # ASR: Faster-Whisper (HTTP)
   # ==============================

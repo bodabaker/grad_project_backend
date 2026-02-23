@@ -7,3 +7,9 @@ models/whisper-medium/
 yehia7b*
 llm/*
 llama/*
+Computer Vision/*
+*.docx
+*.pdf
+# ignore all md files other than readme.md
+*.md
+!readme.md
