@@ -136,7 +136,7 @@ services:
   # --------------------------------------------------
   face-service:
     build:
-      context: ./
+      context: ./CV/face-detection
       dockerfile: Dockerfile
     container_name: face-service
     group_add:
@@ -149,8 +149,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./persons:/data/persons:ro
-      - ./captures:/data/caps
+      - ./CV/face-detection/persons:/data/persons:ro
+      - ./CV/face-detection/captures:/data/caps
     depends_on:
       - mosquitto
       - mediamtx
