@@ -160,6 +160,30 @@ services:
       - aiot_net
 
   # --------------------------------------------------
+  # Fire Detection Service (consumer of RTSP)
+  # --------------------------------------------------
+  fire-service:
+    build:
+      context: ./CV/fire-detection
+      dockerfile: Dockerfile
+    container_name: fire-service
+    environment:
+      - TZ=Etc/UTC
+      - CAMERA_URL=rtsp://mediamtx:8554/cam
+      - MODEL_PATH=/models/fire_model.pt
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./Computer Vision/Fire_Detection-main:/models:ro
+      - ./CV/fire-detection/captures:/data/caps
+    depends_on:
+      - mediamtx
+      - camera-publisher
+    restart: unless-stopped
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
   # n8n Automation Server
   # --------------------------------------------------
   n8n:
