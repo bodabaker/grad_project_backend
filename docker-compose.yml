@@ -174,8 +174,31 @@ services:
     ports:
       - "8010:8010"
     volumes:
-      - ./Computer Vision/Fire_Detection-main:/models:ro
+      - ./CV/fire-detection/models:/models:ro
       - ./CV/fire-detection/captures:/data/caps
+    depends_on:
+      - mediamtx
+      - camera-publisher
+    restart: unless-stopped
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
+  # Object Detection Service (consumer of RTSP)
+  # --------------------------------------------------
+  object-service:
+    build:
+      context: ./CV/object-detection
+      dockerfile: Dockerfile
+    container_name: object-service
+    environment:
+      - TZ=Etc/UTC
+      - CAMERA_URL=rtsp://mediamtx:8554/cam
+    ports:
+      - "8020:8020"
+    volumes:
+      - ./CV/object-detection/models:/models:ro
+      - ./CV/object-detection/captures:/data/caps
     depends_on:
       - mediamtx
       - camera-publisher
