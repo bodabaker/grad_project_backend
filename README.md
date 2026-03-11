@@ -113,13 +113,64 @@ Internal docker services:
 ---
 
 
-## 🔌 [PUBLIC] n8n API Endpoints
+## 🔌 [PUBLIC] n8n Workflows & Webhooks
 
-Key api URLs (base: `http://<HOST IP>:5678`):
-- `/api/camera-feed` - [Get] — Redirects to docker container that streams camera feed
-- `/api/door` - [POST] — Broadcasts MQTT message to open door
-- `/api/agent` - [POST] => json_params: sessionId, message — Interact with AI and recieve streamed output
-- `/api/voice` - [POST] — Send an audio file and receive an audio reply from the AI agent
+All public-facing API endpoints are now implemented as n8n workflows and triggered via HTTP webhooks.
+
+Base URL: `http://<HOST IP>:5678/run`
+
+**Available Webhooks:**
+- `POST /camera-feed` — Get camera feed from RTSP stream
+- `POST /door` — Trigger door open via MQTT broadcast
+- `POST /agent` — Interact with AI agent (params: `sessionId`, `message`)
+- `POST /voice` — Send audio file and receive AI agent audio response
+
+### Scenario Automation Endpoints
+
+The smart-home scenario CRUD/toggle API is exposed through n8n webhooks:
+
+- `POST /scenarios/create` — Create and activate a scenario
+- `GET /scenarios/get` — List all scenarios
+- `POST /scenarios/update?id=<workflow-id>` — Update an existing scenario
+- `DELETE /scenarios/delete?id=<workflow-id>` — Delete a scenario
+- `POST /scenarios/toggle?id=<workflow-id>` — Activate/deactivate a scenario
+
+### Input JSON Structure (Create / Update)
+
+`POST /scenarios/create` and `POST /scenarios/update` accept the same JSON body:
+
+```json
+{
+  "name": "My Automation",
+  "trigger": {
+    "type": "sensor",
+    "sensor": "gas",
+    "condition": "greater_than",
+    "value": 400
+  },
+  "actions": [
+    { "device": "buzzer", "action": "on" },
+    { "device": "lights_rgb", "action": "c #FF0000" },
+    { "delay": 10, "unit": "seconds" }
+  ]
+}
+```
+
+**Required top-level fields:**
+- `name` (`string`): Human-readable scenario name
+- `trigger` (`object`): Trigger definition (sensor or schedule)
+- `actions` (`array`): Ordered list of device actions and/or delays
+
+**Toggle body (`POST /scenarios/toggle`):**
+
+```json
+{ "active": true }
+```
+
+`active` is a required `boolean` (`true` to enable, `false` to disable).
+
+**n8n Workflow Triggers:**
+All endpoints trigger corresponding n8n workflows that orchestrate the logic, handle MQTT communication, and manage service calls.
 ---
 
 ## n8n Workflows

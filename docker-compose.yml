@@ -1,39 +1,5 @@
 services:
   # --------------------------------------------------
-  # MQTT Broker
-  # --------------------------------------------------
-  mosquitto:
-    image: eclipse-mosquitto:2
-    container_name: mosquitto
-    ports:
-      - "1883:1883"
-    volumes:
-      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - mosq_data:/mosquitto/data
-      - mosq_log:/mosquitto/log
-    restart: unless-stopped
-    networks:
-      - video_net   # <-- attach to same network as face-service
-
-  # --------------------------------------------------
-  # Beacon Service (host network)
-  # --------------------------------------------------
-  broker-beacon:
-    image: python:3.11-slim
-    container_name: broker-beacon
-    network_mode: host
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - BEACON_NAME=face-broker
-      - BEACON_PORT=18830
-      - BROKER_PORT=1883
-      # - BEACON_STATIC_IP=192.168.1.10
-    volumes:
-      - ./beacon.py:/app/beacon.py:ro
-    command: ["python", "/app/beacon.py"]
-
-  # --------------------------------------------------
   # MediaMTX (RTSP / RTMP / HLS / WebRTC) Server
   # --------------------------------------------------
   mediamtx:
@@ -48,7 +14,93 @@ services:
       - "8888:8888"   # HLS
       - "8889:8889"   # WebRTC
     networks:
-      - video_net
+      - aiot_net
+  # --------------------------------------------------
+  # MQTT Broker
+  # --------------------------------------------------
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosq_data:/mosquitto/data
+      - mosq_log:/mosquitto/log
+    restart: unless-stopped
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
+  # LLM: llama.cpp server - Qwen 2.5 7B (GPU)
+  # --------------------------------------------------
+  llama-qwen:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8157
+    container_name: llama-qwen
+    restart: unless-stopped
+    mem_limit: 8g
+    memswap_limit: 8g
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./llama/models:/models
+      - ./llama/grammars:/grammars
+    environment:
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_VERBOSE=1
+      - LLAMA_ARG_MODELS_PRESET=/models/presets-qwen.ini
+      - LLAMA_ARG_MODELS_MAX=1
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--models-preset"
+      - "/models/presets-qwen.ini"
+      - "--models-max"
+      - "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
+  # LLM: llama.cpp server - NileChat 3B (CPU)
+  # --------------------------------------------------
+  llama-nilechat:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8157
+    container_name: llama-nilechat
+    restart: unless-stopped
+    mem_limit: 8g
+    memswap_limit: 8g
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./llama/models:/models
+      - ./llama/grammars:/grammars
+    environment:
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_VERBOSE=1
+      - LLAMA_ARG_MODELS_PRESET=/models/presets-nilechat.ini
+      - LLAMA_ARG_MODELS_MAX=1
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--models-preset"
+      - "/models/presets-nilechat.ini"
+      - "--models-max"
+      - "1"
+    networks:
+      - aiot_net
 
   # --------------------------------------------------
   # Camera Publisher (captures webcam and publishes to RTSP)
@@ -75,7 +127,7 @@ services:
     volumes:
       - ./camera_publish.sh:/app/publish.sh:ro
     networks:
-      - video_net
+      - aiot_net
     entrypoint: ["/bin/sh", "-c"]
     command: ["exec sh /app/publish.sh"]
 
@@ -105,7 +157,7 @@ services:
       - camera-publisher
     restart: unless-stopped
     networks:
-      - video_net
+      - aiot_net
 
   # --------------------------------------------------
   # n8n Automation Server
@@ -115,6 +167,7 @@ services:
     container_name: n8n
     environment:
       - N8N_BASIC_AUTH_ACTIVE=false
+      - N8N_PUBLIC_API_DEFAULT=false
       - N8N_DIAGNOSTICS_ENABLED=false
       - N8N_DEFAULT_LOCALE=en
       - GENERIC_TIMEZONE=Etc/UTC
@@ -123,7 +176,7 @@ services:
       - N8N_EXECUTIONS_DATA_PRUNE=true
       - N8N_EXECUTIONS_DATA_MAX_AGE=168
       - N8N_EXECUTIONS_PRUNE_INTERVAL=60
-      - N8N_ENDPOINT_WEBHOOK=api
+      - N8N_ENDPOINT_WEBHOOK=run
       - NODE_FUNCTION_ALLOW_EXTERNAL=langchain,langchain/*,@langchain/*
     ports:
       - "5678:5678"
@@ -134,7 +187,7 @@ services:
       - 8.8.4.4
     restart: unless-stopped
     networks:
-      - video_net
+      - aiot_net
 
   # ollama:
   #   image: ollama/ollama:latest
@@ -151,7 +204,7 @@ services:
   #     - "11434:11434"           # Ollama HTTP API
   #   restart: unless-stopped
   #   networks:
-  #     - video_net
+  #     - aiot_net
 
   # ollama:
   #   build: ./llm
@@ -167,19 +220,37 @@ services:
   #   ports:
   #     - "11434:11434"
   #   networks:
-  #     - video_net
+  #     - aiot_net
 
+  # --------------------------------------------------
+  # LLM: llama.cpp server with multiple models
+  # --------------------------------------------------
   ollama:
-    # Note: Official image is usually under 'ggerganov', not 'ggml-org'
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8157
     container_name: ollama
+    restart: unless-stopped
+    mem_limit: 8g
+    memswap_limit: 8g
     ports:
       - "8080:8080"
     volumes:
       - ./llama/models:/models
       - ./llama/grammars:/grammars
-    
-    # REQUIRED for 'server-cuda' to actually see your GPU
+    environment:
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_VERBOSE=1
+      - LLAMA_ARG_MODELS_PRESET=/models/presets.ini
+      - LLAMA_ARG_MODELS_MAX=1
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--models-preset"
+      - "/models/presets.ini"
+      - "--models-max"
+      - "1"
     deploy:
       resources:
         reservations:
@@ -187,30 +258,9 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-
-    command:
-      - "-m"
-      - "/models/qwen25-7b-instruct.Q4_K_M.gguf"
-      # - "-m"
-      # - "/models/Yehia-7B-preview.Q4_K_M.gguf"
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8080"
-      - "--ctx-size"
-      - "4096"
-      - "--threads"
-      - "8"
-      - "--flash-attn"
-      - "on"
-      - "--verbose"
-      - "--grammar-file"
-      - "/grammars/arabic-only.gbnf"
-      # - "--parallel"
-      # - "1"
-
     networks:
-      - video_net
+      - aiot_net
+
 
   # =========================
   # TTS: Piper (HTTP server)
@@ -233,60 +283,64 @@ services:
   #   ports:
   #     - "5002:5002"
   #   networks:
-  #     - video_net
+  #     - aiot_net
   #   restart: unless-stopped
 
 # --- append in your docker-compose.yml ---
 
-  # --------------------------------------------------
-  # TTS: Fish Speech (HTTP inference server)
-  # --------------------------------------------------
-  piper:
-    build:
-      context: ./piper-image
-      dockerfile: Dockerfile
-    container_name: piper
-    restart: unless-stopped
-    command:
-      - "--port"
-      - "5000"
-    environment:
-      - PIPER_MODEL=/app/models/ar_JO-kareem-medium/model.onnx
-      - PIPER_CONFIG=/app/models/ar_JO-kareem-medium/model.json
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./voices/ar_JO-kareem-medium:/app/models/ar_JO-kareem-medium:ro
-    networks:
-      - video_net
+  # # --------------------------------------------------
+  # # TTS: Fish Speech (HTTP inference server)
+  # # --------------------------------------------------
+  # piper:
+  #   build:
+  #     context: ./piper-image
+  #     dockerfile: Dockerfile
+  #   container_name: piper
+  #   restart: unless-stopped
+  #   command:
+  #     - "--port"
+  #     - "5000"
+  #   environment:
+  #     - PIPER_MODEL=/app/models/ar_JO-kareem-medium/model.onnx
+  #     - PIPER_CONFIG=/app/models/ar_JO-kareem-medium/model.json
+  #   ports:
+  #     - "5000:5000"
+  #   volumes:
+  #     - ./voices/ar_JO-kareem-medium:/app/models/ar_JO-kareem-medium:ro
+  #   networks:
+  #     - aiot_net
 
   # --------------------------------------------------
-  # TTS: Fish Audio (HTTP inference server)
+  # TTS: Fish Audio (HTTP inference server - CPU mode)
   # --------------------------------------------------
   fish-speech:
-    image: fishaudio/fish-speech:latest-server-cuda
+    image: fishaudio/fish-speech:server-cpu
     container_name: fish-speech
     restart: unless-stopped
     ports:
-      - "8085:8080"          # Fish Audio API server
-    command: ["--half", "--workers", "1"]
+      - "8086:8080"          # Fish Audio API server
+    command: 
+      - "--device"
+      - "cpu"
+      - "--workers"
+      - "1"
+      - "--max-text-length"
+      - "200"
     volumes:
       - ./fish-speech/checkpoints:/app/checkpoints
       - ./fish-speech/references:/app/references
     environment:
-      - COMPILE=0                                                  # Keep torch.compile off
+      - COMPILE=0                                                  # torch.compile not supported on CPU
+      - OMP_NUM_THREADS=16                                         # Use all 16 CPU cores
+      - TORCH_NUM_THREADS=16                                       # PyTorch uses all available cores
+      - TORCH_NUM_INTEROP_THREADS=4                                # Inter-op threading
+      - MKL_NUM_THREADS=16                                         # Intel MKL uses all cores
+      - OPENBLAS_NUM_THREADS=16                                    # OpenBLAS uses all cores
       - LLAMA_CHECKPOINT_PATH=checkpoints/openaudio-s1-mini        # Path to model weights
       - DECODER_CHECKPOINT_PATH=checkpoints/openaudio-s1-mini/codec.pth
       - DECODER_CONFIG_NAME=modded_dac_vq
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     networks:
-      - video_net
+      - aiot_net
 
   # ==============================
   # ASR: Faster-Whisper (HTTP)
@@ -314,7 +368,7 @@ services:
     ports:
       - "5003:5003"
     networks:
-      - video_net
+      - aiot_net
     restart: unless-stopped
 
 volumes:
@@ -327,5 +381,5 @@ volumes:
 # Networks & Volumes
 # --------------------------------------------------
 networks:
-  video_net:
+  aiot_net:
     driver: bridge

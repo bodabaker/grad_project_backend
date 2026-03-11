@@ -13,3 +13,5 @@ Computer Vision/*
 # ignore all md files other than readme.md
 *.md
 !readme.md
+*.wav
+fish*
