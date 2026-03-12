@@ -1,6 +1,6 @@
-# 🧠 Face Detection + MQTT + n8n Automation Stack
+# 🧠 AIoT Vision + MQTT + n8n Automation Stack
 
-This project integrates a **Python-based face detection microservice**, a **Mosquitto MQTT broker**, a **discovery beacon**, and an **n8n automation platform** — all running inside Docker. The stack enables automated workflows triggered by face recognition events and MQTT communication with other devices (e.g., ESP32, IoT lights).
+This project integrates multiple **Python-based computer vision microservices**, a **Mosquitto MQTT broker**, a **discovery beacon**, and an **n8n automation platform** — all running inside Docker. The stack enables automated workflows triggered by camera events and MQTT communication with other devices (e.g., ESP32, IoT lights).
 
 ---
 
@@ -8,13 +8,17 @@ This project integrates a **Python-based face detection microservice**, a **Mosq
 
 | Component        | Purpose                                                                 |
 |------------------|-------------------------------------------------------------------------|
-| face-service     | FastAPI container using OpenCV & face_recognition for webcam detection.  |
+| face-service     | Face recognition service using OpenCV + `face_recognition`.              |
+| fire-service     | Fire detection service using YOLOv8.                                     |
+| object-service   | Object detection service using OpenCV DNN (SSD MobileNet COCO).          |
+| ocr-service      | OCR service using EasyOCR with tunable detection parameters.             |
+| body-service     | Body/pose/fall detection service using YOLOv8 pose model.                |
+| gesture-service  | Hand-based floor-zone gesture classifier (top=first, bottom=second).     |
 | mosquitto        | Lightweight MQTT broker for service communication.                       |
 | broker-beacon    | UDP broadcaster announcing the broker's IP for device auto-discovery.    |
 | n8n              | Visual automation platform orchestrating workflows via MQTT/API triggers. |
 | mediamtx         | RTSP/RTMP/HLS/WebRTC server for camera stream distribution.             |
 | camera-publisher | FFmpeg container that captures webcam feed and publishes to RTSP.       |
-| face-service     | Face recognition service that consumes RTSP stream for processing.      |
 
 Everything is self-contained and reproducible — no manual setup required.
 
@@ -102,6 +106,11 @@ curl -s http://localhost:11434/api/generate \
 Internal docker services:
 - n8n workflows: [http://localhost:5678](http://localhost:5678)
 - Face detection API: port 8000
+- Fire detection API: port 8010
+- Object detection API: port 8020
+- OCR API: port 8030
+- Body detection API: port 8040
+- Gesture control API: port 8050
 - MQTT broker: port 1883
 - MediaMTX streaming:
   - RTSP: port 8554
@@ -202,6 +211,47 @@ Key endpoints:
 - `GET /healthz` — Service health check
 - `POST /detect-webcam` — Detect faces from webcam, save annotated frames
 - `GET /stream` — MJPEG live stream
+
+---
+
+## 👁️ [PRIVATE] CV Services API Summary
+
+### Fire Detection (`fire-service`, port 8010)
+- `GET /healthz`
+- `POST /detect-image`
+- `POST /detect-webcam`
+- `GET /stream`
+- `GET /ui`
+
+### Object Detection (`object-service`, port 8020)
+- `GET /healthz`
+- `POST /detect-image`
+- `POST /detect-webcam`
+- `GET /stream`
+- `GET /ui`
+
+### OCR (`ocr-service`, port 8030)
+- `GET /healthz`
+- `POST /detect-image`
+- `POST /detect-webcam`
+- `GET /stream`
+
+### Body Detection (`body-service`, port 8040)
+- `GET /healthz`
+- `POST /detect-image`
+- `POST /detect-webcam`
+- `GET /stream`
+- `GET /ui`
+
+### Gesture Control (`gesture-service`, port 8050)
+- `GET /healthz`
+- `POST /detect-webcam`
+
+Gesture response includes:
+- `last_detected_floor` (`first_floor` or `second_floor`)
+- `floor_hits`
+- `detections_count`
+- optional `timeline` (if `include_timeline=true`)
 
 Example webcam detection:
 ```bash
