@@ -32,6 +32,23 @@ services:
       - aiot_net
 
   # --------------------------------------------------
+  # Broker Beacon (UDP discovery for MQTT broker)
+  # --------------------------------------------------
+  server-beacon:
+    image: python:3.11-slim
+    container_name: server-beacon
+    working_dir: /app
+    command: ["python", "/app/beacon.py"]
+    volumes:
+      - ./beacon.py:/app/beacon.py:ro
+    environment:
+      - TZ=Etc/UTC
+    depends_on:
+      - mosquitto
+    network_mode: host
+    restart: unless-stopped
+
+  # --------------------------------------------------
   # LLM: llama.cpp server - Qwen 2.5 7B (GPU)
   # --------------------------------------------------
   llama-qwen:

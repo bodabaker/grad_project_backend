@@ -2,7 +2,7 @@
 import json, socket, time, sys
 
 PORT = 18830
-NAME = "face-broker"
+NAME = "server-beacon"
 BROKER_PORT = 1883
 
 def host_ip():

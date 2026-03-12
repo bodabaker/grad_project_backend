@@ -15,7 +15,7 @@ This project integrates multiple **Python-based computer vision microservices**,
 | body-service     | Body/pose/fall detection service using YOLOv8 pose model.                |
 | gesture-service  | Hand-based floor-zone gesture classifier (top=first, bottom=second).     |
 | mosquitto        | Lightweight MQTT broker for service communication.                       |
-| broker-beacon    | UDP broadcaster announcing the broker's IP for device auto-discovery.    |
+| server-beacon    | UDP broadcaster announcing the broker's IP for device auto-discovery.    |
 | n8n              | Visual automation platform orchestrating workflows via MQTT/API triggers. |
 | mediamtx         | RTSP/RTMP/HLS/WebRTC server for camera stream distribution.             |
 | camera-publisher | FFmpeg container that captures webcam feed and publishes to RTSP.       |
@@ -359,7 +359,7 @@ This only needs to be done once per clone.
 
 You now have a complete system that:
 - Detects faces via face-service
-- Broadcasts broker presence with broker-beacon
+- Broadcasts broker presence with server-beacon
 - Syncs data in n8n via Git + LFS
 - Is 100% reproducible and portable
 
