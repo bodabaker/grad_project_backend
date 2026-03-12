@@ -207,6 +207,53 @@ services:
       - aiot_net
 
   # --------------------------------------------------
+  # OCR Service (Text Detection with EasyOCR)
+  # --------------------------------------------------
+  ocr-service:
+    build:
+      context: ./CV/ocr
+      dockerfile: Dockerfile
+    container_name: ocr-service
+    environment:
+      - TZ=Etc/UTC
+      - CAMERA_URL=rtsp://mediamtx:8554/cam
+      - EASYOCR_MODULE_PATH=/models/easyocr
+    ports:
+      - "8030:8030"
+    volumes:
+      - ./CV/ocr/models:/models/easyocr
+      - ./CV/ocr/captures:/data/caps
+    depends_on:
+      - mediamtx
+      - camera-publisher
+    restart: unless-stopped
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
+  # Body Detection Service (Pose / Fall Detection)
+  # --------------------------------------------------
+  body-service:
+    build:
+      context: ./CV/body-detection
+      dockerfile: Dockerfile
+    container_name: body-service
+    environment:
+      - TZ=Etc/UTC
+      - CAMERA_URL=rtsp://mediamtx:8554/cam
+    ports:
+      - "8040:8040"
+    volumes:
+      - ./CV/body-detection/models:/models:ro
+      - ./CV/body-detection/captures:/data/caps
+    depends_on:
+      - mediamtx
+      - camera-publisher
+    restart: unless-stopped
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
   # n8n Automation Server
   # --------------------------------------------------
   n8n:
