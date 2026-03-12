@@ -254,6 +254,29 @@ services:
       - aiot_net
 
   # --------------------------------------------------
+  # Gesture Control Service (Hands + MQTT)
+  # --------------------------------------------------
+  gesture-service:
+    build:
+      context: ./CV/gesture-control
+      dockerfile: Dockerfile
+    container_name: gesture-service
+    environment:
+      - TZ=Etc/UTC
+      - CAMERA_URL=rtsp://mediamtx:8554/cam
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./CV/gesture-control/references:/data/references:ro
+      - ./CV/gesture-control/captures:/data/caps
+    depends_on:
+      - mediamtx
+      - camera-publisher
+    restart: unless-stopped
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
   # n8n Automation Server
   # --------------------------------------------------
   n8n:

@@ -3,6 +3,7 @@ CV/face-detection/captures/*
 CV/fire-detection/captures/*
 CV/object-detection/captures/*
 CV/body-detection/captures/*
+CV/gesture-control/captures/*
 sketch_*/
 n8n_data/crash.journal
 arabic-*
