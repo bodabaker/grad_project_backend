@@ -311,7 +311,7 @@ services:
       - N8N_EXECUTIONS_DATA_MAX_AGE=168
       - N8N_EXECUTIONS_PRUNE_INTERVAL=60
       - N8N_ENDPOINT_WEBHOOK=run
-      - NODE_FUNCTION_ALLOW_EXTERNAL=langchain,langchain/*,@langchain/*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=langchain,@langchain/*
     ports:
       - "5678:5678"
     volumes:
