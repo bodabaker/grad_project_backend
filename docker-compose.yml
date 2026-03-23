@@ -49,16 +49,17 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------
-  # LLM: llama.cpp server - Qwen 2.5 7B (GPU)
+  # LLM: llama.cpp server - Qwen 3.5 4B (GPU)
   # --------------------------------------------------
   llama-qwen:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8157
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+    pull_policy: always
     container_name: llama-qwen
     restart: unless-stopped
     mem_limit: 8g
     memswap_limit: 8g
     ports:
-      - "8081:8080"
+      - "8080:8080"
     volumes:
       - ./llama/models:/models
       - ./llama/grammars:/grammars
@@ -73,10 +74,39 @@ services:
       - "0.0.0.0"
       - "--port"
       - "8080"
-      - "--models-preset"
-      - "/models/presets-qwen.ini"
+      # - "--models-preset"
+      # - "/models/presets-qwen.ini"
       - "--models-max"
       - "1"
+      - "-c"
+      - "20000"
+      - "-b"
+      - "512"
+      - "-ub"
+      - "512"
+      - "-ngl"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "bf16"
+      - "--cache-type-v"
+      - "bf16"
+      - "--no-mmap"
+      - "-dio"
+      - "--backend-sampling"
+      - "-t"
+      - "10"
+      - "-tb"
+      - "10"
+      - "-np"
+      - "1"
+      # - "--repeat-penalty"
+      # - "1.0"
+      # - "--presence-penalty"
+      # - "0.0"
+      - "--chat-template-kwargs"
+      - "{\"enable_thinking\":true}"
     deploy:
       resources:
         reservations:
@@ -91,7 +121,8 @@ services:
   # LLM: llama.cpp server - NileChat 3B (CPU)
   # --------------------------------------------------
   llama-nilechat:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8157
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+    pull_policy: always
     container_name: llama-nilechat
     restart: unless-stopped
     mem_limit: 8g
@@ -297,7 +328,10 @@ services:
   # n8n Automation Server
   # --------------------------------------------------
   n8n:
-    image: n8nio/n8n:latest
+    build:
+      context: ./n8n
+      dockerfile: Dockerfile
+    image: aiot-n8n:latest
     container_name: n8n
     environment:
       - N8N_BASIC_AUTH_ACTIVE=false
@@ -311,6 +345,7 @@ services:
       - N8N_EXECUTIONS_DATA_MAX_AGE=168
       - N8N_EXECUTIONS_PRUNE_INTERVAL=60
       - N8N_ENDPOINT_WEBHOOK=run
+      - NODES_EXCLUDE=[]
       - NODE_FUNCTION_ALLOW_EXTERNAL=langchain,@langchain/*
     ports:
       - "5678:5678"
@@ -359,41 +394,41 @@ services:
   # --------------------------------------------------
   # LLM: llama.cpp server with multiple models
   # --------------------------------------------------
-  ollama:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8157
-    container_name: ollama
-    restart: unless-stopped
-    mem_limit: 8g
-    memswap_limit: 8g
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./llama/models:/models
-      - ./llama/grammars:/grammars
-    environment:
-      - LLAMA_ARG_HOST=0.0.0.0
-      - LLAMA_ARG_PORT=8080
-      - LLAMA_ARG_VERBOSE=1
-      - LLAMA_ARG_MODELS_PRESET=/models/presets.ini
-      - LLAMA_ARG_MODELS_MAX=1
-    command:
-      - "--host"
-      - "0.0.0.0"
-      - "--port"
-      - "8080"
-      - "--models-preset"
-      - "/models/presets.ini"
-      - "--models-max"
-      - "1"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    networks:
-      - aiot_net
+  # ollama:
+  #   image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8157
+  #   container_name: ollama
+  #   restart: unless-stopped
+  #   mem_limit: 8g
+  #   memswap_limit: 8g
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./llama/models:/models
+  #     - ./llama/grammars:/grammars
+  #   environment:
+  #     - LLAMA_ARG_HOST=0.0.0.0
+  #     - LLAMA_ARG_PORT=8080
+  #     - LLAMA_ARG_VERBOSE=1
+  #     - LLAMA_ARG_MODELS_PRESET=/models/presets.ini
+  #     - LLAMA_ARG_MODELS_MAX=1
+  #   command:
+  #     - "--host"
+  #     - "0.0.0.0"
+  #     - "--port"
+  #     - "8080"
+  #     - "--models-preset"
+  #     - "/models/presets.ini"
+  #     - "--models-max"
+  #     - "1"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   networks:
+  #     - aiot_net
 
 
   # =========================
