@@ -1,0 +1,2 @@
+n8n_data/database.sqlite* filter=lfs diff=lfs merge=lfs -text
+n8n_data/n8nEventLog*.log filter=lfs diff=lfs merge=lfs -text
