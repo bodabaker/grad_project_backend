@@ -19,3 +19,8 @@ Computer Vision/*
 !readme.md
 *.wav
 fish*
+
+# Large local model artifacts (avoid accidental git add / push failures)
+models/egtts/model.pth
+models/xtts-egy/**
+models/mms-tts-ara/**

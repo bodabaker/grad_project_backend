@@ -53,35 +53,34 @@ services:
   # --------------------------------------------------
   llama-qwen:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda12
-    pull_policy: always
+    # pull_policy: always
     container_name: llama-qwen
     restart: unless-stopped
-    mem_limit: 8g
-    memswap_limit: 8g
+    # mem_limit: 8g
+    # memswap_limit: 8g
     ports:
       - "8080:8080"
     volumes:
       - ./llama/models:/models
       - ./llama/grammars:/grammars
+      - ./llama/mmproj:/mmproj
     environment:
       - LLAMA_ARG_HOST=0.0.0.0
       - LLAMA_ARG_PORT=8080
       - LLAMA_ARG_VERBOSE=1
-      - LLAMA_ARG_MODELS_PRESET=/models/presets-qwen.ini
-      - LLAMA_ARG_MODELS_MAX=1
     command:
       - "--host"
       - "0.0.0.0"
       - "--port"
       - "8080"
-      # - "--models-preset"
-      # - "/models/presets-qwen.ini"
-      - "--models-max"
-      - "1"
+      - "--model"
+      - "/models/Qwen3.5-4B-Q4_K_M.gguf"
+      - "--mmproj"
+      - "/mmproj/mmproj.gguf"
       - "-c"
-      - "20000"
+      - "15000"
       - "-b"
-      - "512"
+      - "2048"
       - "-ub"
       - "512"
       - "-ngl"
@@ -154,11 +153,16 @@ services:
   # Camera Publisher (captures webcam and publishes to RTSP)
   # --------------------------------------------------
   camera-publisher:
-    image: jrottenberg/ffmpeg:6.1-ubuntu
+    build:
+      context: .
+      dockerfile: camera-publisher/Dockerfile
+    entrypoint: ["/app/start.sh"]
     container_name: camera-publisher
     restart: unless-stopped
     depends_on:
       - mediamtx
+    ports:
+      - "8060:8060"
     devices:
       - "/dev/video0:/dev/video0"    # adjust if your camera index differs
       - "/dev/dri:/dev/dri"
@@ -172,12 +176,8 @@ services:
       ENCODER: libx264           # on Raspberry Pi/ARM: h264_v4l2m2m
       BITRATE: 1500k            # Lower bitrate for less latency
       RTSP_URL: rtsp://mediamtx:8554/cam
-    volumes:
-      - ./camera_publish.sh:/app/publish.sh:ro
     networks:
       - aiot_net
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["exec sh /app/publish.sh"]
 
   # --------------------------------------------------
   # Face Recognition Service (consumer of RTSP)
@@ -482,6 +482,29 @@ services:
   # --------------------------------------------------
   # TTS: Fish Audio (HTTP inference server - CPU mode)
   # --------------------------------------------------
+  egtts:
+    build:
+      context: .
+      dockerfile: egtts-service/Dockerfile
+    container_name: egtts
+    restart: unless-stopped
+    environment:
+      - EGTTS_MODEL_ID=ahmednabilgm7/EGTTS-Custom
+      - EGTTS_BASE_MODEL_ID=coqui/XTTS-v2
+      - EGTTS_MODEL_DIR=/models/egtts-cache
+      - EGTTS_LOCAL_MODEL_DIR=/models/egtts
+      - EGTTS_LANGUAGE=ar
+      - EGTTS_DEVICE=cpu
+      - EGTTS_DEFAULT_SPEAKER_WAV=/references/speaker_reference.wav
+    ports:
+      - "5004:5004"
+    volumes:
+      - ./models/egtts:/models/egtts:ro
+      - ./models/xtts-egy:/models/egtts-cache
+      - ./speaker_reference.wav:/references/speaker_reference.wav:ro
+    networks:
+      - aiot_net
+
   fish-speech:
     image: fishaudio/fish-speech:server-cpu
     container_name: fish-speech
@@ -525,6 +548,16 @@ services:
       - WHISPER_DEVICE=cpu            # set to cuda if you enable GPU
       - WHISPER_COMPUTE=float32       # cuda: float16; cpu: int8_float32/float32
       - VAD_FILTER=true               # simple VAD trimming
+      - ASR_LANGUAGE=ar
+      - ASR_BEAM_SIZE=7
+      - ASR_BEST_OF=7
+      - ASR_TEMPERATURE=0.0,0.2
+      - ASR_CONDITION_ON_PREVIOUS_TEXT=false
+      - ASR_REPETITION_PENALTY=1.08
+      - ASR_NO_REPEAT_NGRAM_SIZE=3
+      - ASR_COMPRESSION_RATIO_THRESHOLD=2.2
+      # Optional domain/context prompt to reduce substitutions:
+      # - ASR_INITIAL_PROMPT=هذا نظام منزل ذكي ويتضمن أوامر مثل الضوء والمروحة والتكييف
     volumes:
       - ./models/whisper-medium:/models/whisper-medium:ro
     # Uncomment for NVIDIA GPU:
@@ -540,11 +573,63 @@ services:
       - aiot_net
     restart: unless-stopped
 
+  # ==============================
+  # ASR: Whisper Small Egyptian Arabic (CPU)
+  # ==============================
+  asr-whisper-egy:
+    build:
+      context: ./asr_whisper_egy
+      dockerfile: Dockerfile
+    container_name: asr-whisper-egy
+    environment:
+      - ASR_PORT=5004
+      - HF_WHISPER_MODEL=MAdel121/whisper-small-egyptian-arabic
+      - ASR_LANGUAGE=ar
+      - ASR_CHUNK_LENGTH_S=20
+      - ASR_BATCH_SIZE=8
+      - ASR_PRELOAD_MODEL=true
+      - HF_HOME=/models/hf-cache
+      - CUDA_VISIBLE_DEVICES=
+    volumes:
+      - asr_egy_hf_cache:/models/hf-cache
+    ports:
+      - "5005:5004"
+    networks:
+      - aiot_net
+    restart: unless-stopped
+
+  # ==============================
+  # ASR: Whisper Large V3 Egyptian Arabic Adapter (CPU)
+  # ==============================
+  asr-whisper-egy-large:
+    build:
+      context: ./asr_whisper_egy
+      dockerfile: Dockerfile
+    container_name: asr-whisper-egy-large
+    environment:
+      - ASR_PORT=5004
+      - HF_WHISPER_MODEL=AbdelrahmanHassan/whisper-large-v3-egyptian-arabic
+      - ASR_LANGUAGE=ar
+      - ASR_CHUNK_LENGTH_S=15
+      - ASR_BATCH_SIZE=1
+      - ASR_NUM_BEAMS=1
+      - ASR_PRELOAD_MODEL=false
+      - HF_HOME=/models/hf-cache
+      - CUDA_VISIBLE_DEVICES=
+    volumes:
+      - asr_egy_hf_cache:/models/hf-cache
+    ports:
+      - "5006:5004"
+    networks:
+      - aiot_net
+    restart: unless-stopped
+
 volumes:
   mosq_data:
   mosq_log:
   ollama_data:
   piper_voices:
+  asr_egy_hf_cache:
 
 # --------------------------------------------------
 # Networks & Volumes

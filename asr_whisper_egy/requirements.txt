@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydub
+transformers==4.51.3
+huggingface-hub>=0.30.0
+torch==2.3.1
+accelerate==1.6.0
+peft>=0.13.0
