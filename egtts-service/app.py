@@ -243,55 +243,37 @@ def synthesize(body: SynthesisRequest) -> Response:
         raise HTTPException(status_code=500, detail="EGTTS returned empty audio")
 
     sample_rate = int(getattr(egtts_config.audio, "output_sample_rate", 24000))
+    output_format = (body.output_format or "wav").lower()
+
     buf = io.BytesIO()
     sf.write(buf, wav_np, sample_rate, format="WAV")
+    buf.seek(0)
+
+    if output_format == "mp3":
+        try:
+            audio = AudioSegment.from_wav(buf)
+            mp3_buf = io.BytesIO()
+            audio.export(mp3_buf, format="mp3", bitrate="192k")
+            content = mp3_buf.getvalue()
+            media_type = "audio/mpeg"
+            content_disposition = 'inline; filename="audio.mp3"'
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"MP3 conversion failed: {exc}") from exc
+    else:
+        content = buf.getvalue()
+        media_type = "audio/wav"
+        content_disposition = 'inline; filename="audio.wav"'
 
     return Response(
-        content=buf.getvalue(),
-        media_type="audio/wav",
+        content=content,
+        media_type=media_type,
         headers={
             "X-Sample-Rate": str(sample_rate),
             "X-Model": EGTTS_MODEL_ID,
             "X-Base-Model": EGTTS_BASE_MODEL_ID,
             "X-Checkpoint": checkpoint_file.name if checkpoint_file else "unknown",
             "X-Language": language,
+            "X-Output-Format": output_format,
+            "Content-Disposition": content_disposition,
         },
-    @@
-    @@    sample_rate = int(getattr(egtts_config.audio, "output_sample_rate", 24000))
-    @@    output_format = (body.output_format or "wav").lower()
-    @@    
-    @@    # Write audio to bytes buffer
-    @@    buf = io.BytesIO()
-    @@    sf.write(buf, wav_np, sample_rate, format="WAV")
-    @@    buf.seek(0)
-    @@    
-    @@    # Convert to MP3 if requested
-    @@    if output_format == "mp3":
-    @@        try:
-    @@            audio = AudioSegment.from_wav(buf)
-    @@            mp3_buf = io.BytesIO()
-    @@            audio.export(mp3_buf, format="mp3", bitrate="192k")
-    @@            content = mp3_buf.getvalue()
-    @@            media_type = "audio/mpeg"
-    @@            content_disposition = 'inline; filename="audio.mp3"'
-    @@        except Exception as exc:
-    @@            raise HTTPException(status_code=500, detail=f"MP3 conversion failed: {exc}") from exc
-    @@    else:
-    @@        content = buf.getvalue()
-    @@        media_type = "audio/wav"
-    @@        content_disposition = 'inline; filename="audio.wav"'
-    @@    
-    @@    return Response(
-    @@        content=content,
-    @@        media_type=media_type,
-    @@        headers={
-    @@            "X-Sample-Rate": str(sample_rate),
-    @@            "X-Model": EGTTS_MODEL_ID,
-    @@            "X-Base-Model": EGTTS_BASE_MODEL_ID,
-    @@            "X-Checkpoint": checkpoint_file.name if checkpoint_file else "unknown",
-    @@            "X-Language": language,
-    @@            "X-Output-Format": output_format,
-    @@            "Content-Disposition": content_disposition,
-    @@        },
-    @@    )
     )

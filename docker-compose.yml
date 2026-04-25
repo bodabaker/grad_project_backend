@@ -49,10 +49,12 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------
-  # LLM: llama.cpp server - Qwen 3.5 4B (GPU)
+  # LLM rollback template: llama.cpp server - Qwen 3.5 4B (GPU)
+  # Disabled on purpose. Keep for fast rollback.
   # --------------------------------------------------
+
   llama-qwen:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8757
     # pull_policy: always
     container_name: llama-qwen
     restart: unless-stopped
@@ -63,6 +65,7 @@ services:
     volumes:
       - ./llama/models:/models
       - ./llama/grammars:/grammars
+      - ./llama/mmproj/gemma_mmproj-F16 (1).gguf:/mmproj/gemma-mmproj.gguf:ro
       - ./llama/mmproj:/mmproj
     environment:
       - LLAMA_ARG_HOST=0.0.0.0
@@ -76,9 +79,11 @@ services:
       - "--model"
       - "/models/Qwen3.5-4B-Q4_K_M.gguf"
       - "--mmproj"
-      - "/mmproj/mmproj.gguf"
+      - "/mmproj/gemma-mmproj.gguf"
+      - "--image-min-tokens"
+      - "1024"
       - "-c"
-      - "15000"
+      - "7000"
       - "-b"
       - "2048"
       - "-ub"
@@ -113,41 +118,141 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    gpus: all
     networks:
       - aiot_net
 
   # --------------------------------------------------
-  # LLM: llama.cpp server - NileChat 3B (CPU)
+  # LLM: llama-swap native control plane (GPU)
   # --------------------------------------------------
-  llama-nilechat:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda12
-    pull_policy: always
-    container_name: llama-nilechat
+  llama-swap:
+    build:
+      context: .
+      dockerfile: llama-swap/Dockerfile
+    image: aiot-llama-swap:latest
+    container_name: llama-swap
     restart: unless-stopped
-    mem_limit: 8g
-    memswap_limit: 8g
     ports:
-      - "8082:8080"
+      - "8080:8080"
     volumes:
       - ./llama/models:/models
       - ./llama/grammars:/grammars
+      - ./llama/mmproj:/mmproj
+      - ./llama/llama-swap.yaml:/app/config.yaml:ro
+      - llama_hf_cache:/models/hf-cache
+    command:
+      - "-config"
+      - "/app/config.yaml"
+      - "-listen"
+      - "0.0.0.0:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - aiot_net
+
+  # --------------------------------------------------
+  # LLM: llama.cpp server - Gemma 4 E2B (GPU)
+  # Best-practice defaults from the Gemma 4 model card:
+  # temperature=1.0, top_p=0.95, top_k=64.
+  # --------------------------------------------------
+  gemma-service:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8757
+    container_name: gemma-service
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./llama/models:/models
+      - ./llama/grammars:/grammars
+      - ./llama/mmproj/gemma_mmproj-F16 (1).gguf:/mmproj/mmproj.gguf:ro
     environment:
       - LLAMA_ARG_HOST=0.0.0.0
       - LLAMA_ARG_PORT=8080
       - LLAMA_ARG_VERBOSE=1
-      - LLAMA_ARG_MODELS_PRESET=/models/presets-nilechat.ini
-      - LLAMA_ARG_MODELS_MAX=1
     command:
       - "--host"
       - "0.0.0.0"
       - "--port"
       - "8080"
-      - "--models-preset"
-      - "/models/presets-nilechat.ini"
-      - "--models-max"
+      - "--jinja"
+      - "--model"
+      - "/models/gemma-4-E2B-it-UD-Q4_K_XL.gguf"
+      - "--mmproj"
+      - "/mmproj/mmproj.gguf"
+      - "-c"
+      - "8192"
+      - "-b"
+      - "2048"
+      - "-ub"
+      - "512"
+      - "-ngl"
+      - "999"
+      - "--flash-attn"
+      - "on"
+      - "--cache-type-k"
+      - "q8_0"
+      - "--cache-type-v"
+      - "q8_0"
+      - "--no-mmap"
+      - "-dio"
+      - "--backend-sampling"
+      - "-t"
+      - "10"
+      - "-tb"
+      - "10"
+      - "-np"
       - "1"
+      - "--reasoning-budget"
+      - "2048"
+      - "--chat-template-kwargs"
+      - "{\"enable_thinking\":true}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     networks:
       - aiot_net
+
+  # # --------------------------------------------------
+  # # LLM: llama.cpp server - NileChat 3B (CPU)
+  # # --------------------------------------------------
+  # llama-nilechat:
+  #   image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+  #   pull_policy: always
+  #   container_name: llama-nilechat
+  #   restart: unless-stopped
+  #   mem_limit: 8g
+  #   memswap_limit: 8g
+  #   ports:
+  #     - "8082:8080"
+  #   volumes:
+  #     - ./llama/models:/models
+  #     - ./llama/grammars:/grammars
+  #   environment:
+  #     - LLAMA_ARG_HOST=0.0.0.0
+  #     - LLAMA_ARG_PORT=8080
+  #     - LLAMA_ARG_VERBOSE=1
+  #     - LLAMA_ARG_MODELS_PRESET=/models/presets-nilechat.ini
+  #     - LLAMA_ARG_MODELS_MAX=1
+  #   command:
+  #     - "--host"
+  #     - "0.0.0.0"
+  #     - "--port"
+  #     - "8080"
+  #     - "--models-preset"
+  #     - "/models/presets-nilechat.ini"
+  #     - "--models-max"
+  #     - "1"
+  #   networks:
+  #     - aiot_net
 
   # --------------------------------------------------
   # Camera Publisher (captures webcam and publishes to RTSP)
@@ -534,6 +639,30 @@ services:
     networks:
       - aiot_net
 
+  # --------------------------------------------------
+  # Audio Playback Service (PulseAudio / PipeWire)
+  # --------------------------------------------------
+  speaker-player:
+    build:
+      context: .
+      dockerfile: speaker-player/Dockerfile
+    container_name: speaker-player
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "5007:5007"
+    environment:
+      - AUDIO_LIBRARY_DIR=/audio
+      - PULSE_SERVER=unix:/tmp/pulse/native
+      - PULSE_COOKIE=/tmp/pulse/cookie
+      - SDL_AUDIODRIVER=pulse
+    volumes:
+      - ./speaker-player/audio:/audio
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/pulse/native:/tmp/pulse/native
+      - ${HOME}/.config/pulse/cookie:/tmp/pulse/cookie:ro
+    networks:
+      - aiot_net
+
   # ==============================
   # ASR: Faster-Whisper (HTTP)
   # ==============================
@@ -630,6 +759,7 @@ volumes:
   ollama_data:
   piper_voices:
   asr_egy_hf_cache:
+  llama_hf_cache:
 
 # --------------------------------------------------
 # Networks & Volumes

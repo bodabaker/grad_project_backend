@@ -4,4 +4,5 @@ numpy==1.26.4
 soundfile==0.12.1
 huggingface_hub==0.26.2
 TTS==0.22.0
-@@scipy>=1.11.0
+scipy>=1.11.0
+pydub==0.25.1

@@ -3,7 +3,7 @@ import os
 import importlib
 
 import torch
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
@@ -37,7 +37,14 @@ _model_cache = {"processor": None, "model": None, "asr_pipe": None}
 
 
 def _normalize_audio(audio: AudioSegment) -> AudioSegment:
-    audio = audio.set_channels(1).set_frame_rate(16000).high_pass_filter(80).low_pass_filter(7600)
+    audio = audio.set_channels(1).set_frame_rate(16000)
+    if len(audio) >= 200:
+        try:
+            audio = audio.high_pass_filter(80).low_pass_filter(7600)
+        except Exception:
+            # Some very short or malformed clips can break pydub's filters;
+            # keep the resampled mono audio and continue.
+            pass
     if audio.dBFS != float("-inf"):
         target_dbfs = -20.0
         gain = target_dbfs - audio.dBFS
@@ -67,6 +74,27 @@ def _iter_chunks(audio: AudioSegment):
         chunk = audio[start:start + chunk_ms]
         if len(chunk) > 80:
             yield chunk
+
+
+def _load_uploaded_audio(file: UploadFile, raw: bytes) -> AudioSegment:
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    is_wav = filename.endswith(".wav") or content_type in ("audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave")
+
+    try:
+        if is_wav:
+            return AudioSegment.from_wav(io.BytesIO(raw))
+        return AudioSegment.from_file(io.BytesIO(raw))
+    except Exception as exc:
+        if not is_wav:
+            try:
+                return AudioSegment.from_wav(io.BytesIO(raw))
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported or unreadable audio file: {file.filename or 'uploaded file'}",
+        ) from exc
 
 
 def _collapse_loops(text: str) -> str:
@@ -177,7 +205,9 @@ async def transcribe(
     }
     whisper_lang = lang_map.get(lang, lang)
     raw = await file.read()
-    audio = _trim_nonsilent(_normalize_audio(AudioSegment.from_file(io.BytesIO(raw))))
+    audio = _trim_nonsilent(_normalize_audio(_load_uploaded_audio(file, raw)))
+    if len(audio) == 0:
+        return JSONResponse({"text": "", "language": language})
     forced_decoder_ids = processor.get_decoder_prompt_ids(language=whisper_lang, task="transcribe")
 
     chunk_texts = []

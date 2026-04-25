@@ -14,6 +14,8 @@ This project integrates multiple **Python-based computer vision microservices**,
 | ocr-service      | OCR service using EasyOCR with tunable detection parameters.             |
 | body-service     | Body/pose/fall detection service using YOLOv8 pose model.                |
 | gesture-service  | Hand-based floor-zone gesture classifier (top=first, bottom=second).     |
+| gemma-service    | Gemma 4 E2B local chat server powered by llama.cpp.                      |
+| speaker-player   | PulseAudio/PipeWire playback API for uploaded or stored audio.           |
 | mosquitto        | Lightweight MQTT broker for service communication.                       |
 | server-beacon    | UDP broadcaster announcing the broker's IP for device auto-discovery.    |
 | n8n              | Visual automation platform orchestrating workflows via MQTT/API triggers. |
@@ -47,6 +49,11 @@ project-root/
 ├── persons/             # known people images
 ├── scripts/            # utility scripts
 │   └── n8n-prune.sh    # database cleanup helper
+├── speaker-player/     # PulseAudio/PipeWire audio playback service
+│   ├── audio/          # stored playable audio files
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── .gitattributes
 └── .gitignore
 ```
@@ -111,6 +118,8 @@ Internal docker services:
 - OCR API: port 8030
 - Body detection API: port 8040
 - Gesture control API: port 8050
+- Gemma 4 E2B API: port 8081
+- Speaker playback API: port 5007
 - MQTT broker: port 1883
 - MediaMTX streaming:
   - RTSP: port 8554
@@ -247,6 +256,15 @@ Key endpoints:
 - `GET /healthz`
 - `POST /detect-webcam`
 
+### Speaker Playback (`speaker-player`, port 5007)
+- `GET /healthz`
+- `GET /files`
+- `POST /play` — stream an uploaded audio file directly to the laptop speakers
+- `POST /play-stored` — play a file stored inside the mounted audio folder
+
+The playback service uses the host PulseAudio/PipeWire socket and blocks the request until playback completes.
+If your host uses a non-default session path, set `XDG_RUNTIME_DIR`, `HOME`, `UID`, and `GID` before starting the stack so Docker can mount the correct socket and cookie.
+
 Gesture response includes:
 - `last_detected_floor` (`first_floor` or `second_floor`)
 - `floor_hits`
@@ -315,6 +333,19 @@ git add n8n_data/database.sqlite
 git commit -m "Backup latest n8n state"
 git push
 ```
+
+### Remove n8n images before commit
+If you want to remove execution images/files before committing, run:
+
+```bash
+PURGE_ALL_EXECUTIONS=1 REMOVE_BINARY_DATA=1 UNTRACK_RUNTIME_FILES=1 ./scripts/n8n-prune.sh
+```
+
+This command does four things safely:
+- deletes execution rows from the n8n SQLite database
+- removes generated files from `n8n_data/binaryData/`
+- clears WAL/SHM + event logs
+- removes those runtime artifacts from the Git index (without deleting tracked source files)
 
 ### Restore on a New Machine
 ```bash
