@@ -1,6 +1,7 @@
 import os
 import base64
 import subprocess
+import time
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -53,6 +54,16 @@ async def frame(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-avioflags",
+        "direct",
         "-rtsp_transport",
         "tcp",
         "-i",
@@ -68,20 +79,35 @@ async def frame(
         "-",
     ]
 
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=float(timeout_seconds),
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return JSONResponse(status_code=504, content={"error": "Timed out waiting for camera frame"})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Frame capture failed: {e}"})
+    # Try a few times for transient DNS/RTSP/connect errors
+    attempts = 3
+    completed = None
+    for attempt in range(1, attempts + 1):
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=float(timeout_seconds),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return JSONResponse(status_code=504, content={"error": "Timed out waiting for camera frame"})
+        except Exception as e:
+            if attempt == attempts:
+                return JSONResponse(status_code=500, content={"error": f"Frame capture failed: {e}"})
+            time.sleep(0.8)
+            continue
 
-    if completed.returncode != 0:
-        stderr = (completed.stderr or b"").decode("utf-8", errors="ignore").strip()
+        if completed is not None and completed.returncode == 0:
+            break
+
+        # non-zero return code: retry a couple times for transient network issues
+        if attempt < attempts:
+            time.sleep(0.8)
+            continue
+
+    if completed is None or completed.returncode != 0:
+        stderr = (completed.stderr or b"").decode("utf-8", errors="ignore").strip() if completed else ""
         return JSONResponse(
             status_code=500,
             content={

@@ -4,7 +4,7 @@ import importlib
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
@@ -187,6 +187,27 @@ def healthz():
         "num_beams": NUM_BEAMS,
         "batch_size": BATCH_SIZE,
     }
+
+
+@app.post("/convert")
+async def convert_audio(file: UploadFile = File(...)):
+    """Converts any audio format to WAV (16kHz, mono)."""
+    try:
+        raw = await file.read()
+        audio = AudioSegment.from_file(io.BytesIO(raw))
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        
+        wav_io = io.BytesIO()
+        audio.export(wav_io, format="wav")
+        wav_io.seek(0)
+        
+        return StreamingResponse(
+            wav_io,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "attachment; filename=converted.wav"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Conversion failed: {str(e)}")
 
 
 @app.post("/transcribe")

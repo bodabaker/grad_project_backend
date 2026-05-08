@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mqtt-tool"
+version = "0.1.0"
+dependencies = ["typer", "paho-mqtt"]
+
+[project.scripts]
+mqtt_tool = "mqtt_tool:app"
+
+[tool.setuptools]
+py-modules = ["mqtt_tool"]

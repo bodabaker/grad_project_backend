@@ -1,0 +1,41 @@
+{
+  "name": "n8n-nodes-ai-agent-v2",
+  "version": "1.0.0",
+  "description": "AI Agent V2 - supports text/audio input with tool calling and thinking stripper",
+  "keywords": [
+    "n8n",
+    "node",
+    "ai",
+    "agent",
+    "audio",
+    "tool-calling"
+  ],
+  "license": "MIT",
+  "homepage": "",
+  "author": {
+    "name": "AIoT Stack",
+    "email": ""
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "files": [
+    "AiAgentV2.node.js",
+    "AiAgentV2.node.json",
+    "ai-agent-v2.svg",
+    "utils"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "nodes": [
+      "AiAgentV2.node.js"
+    ],
+    "credentials": []
+  },
+  "dependencies": {}
+}

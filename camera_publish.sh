@@ -14,6 +14,22 @@ echo "[camera-publisher] Using device=$CAM_DEVICE size=$CAM_SIZE fps=$CAM_FPS en
 # Optional: uncomment to print supported formats
 # ffmpeg -hide_banner -f v4l2 -list_formats all -i "$CAM_DEVICE" || true
 
+# Wait for Docker DNS to resolve mediamtx before starting the publisher loop
+echo "[camera-publisher] waiting for mediamtx DNS..."
+until python3 - <<'PY'
+import socket,sys
+try:
+    socket.gethostbyname("mediamtx")
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+PY
+do
+  echo "[camera-publisher] mediamtx not resolvable yet; retrying..."
+  sleep 1
+done
+
+
 while true; do
   echo "[camera-publisher] starting ffmpeg..."
   ffmpeg -hide_banner -loglevel info -nostdin \

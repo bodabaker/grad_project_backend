@@ -4,6 +4,10 @@ set -euo pipefail
 # Only run if DB file exists in this repo
 [ -f "${DB_PATH:-n8n_data/database.sqlite}" ] || exit 0
 
+# Pruning rewrites the SQLite file, so keep it opt-in to avoid dirtying the
+# working tree after every commit.
+[ "${N8N_PRUNE_ON_COMMIT:-0}" = "1" ] || exit 0
+
 scripts/n8n-prune.sh
 
 # Optional size note (doesn’t block the commit)

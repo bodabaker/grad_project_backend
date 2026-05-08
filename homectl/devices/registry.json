@@ -1,0 +1,75 @@
+{
+  "actuators": {
+    "fan": {
+      "command_topic": "home/actuators/fan",
+      "state_topic": "home/actuators/fan/state",
+      "actions": ["in", "out", "off"]
+    },
+    "light_floor1": {
+      "command_topic": "home/actuators/lights/floor1",
+      "state_topic": "home/actuators/lights/floor1/state",
+      "actions": ["on", "off"]
+    },
+    "light_floor2": {
+      "command_topic": "home/actuators/lights/floor2",
+      "state_topic": "home/actuators/lights/floor2/state",
+      "actions": ["on", "off"]
+    },
+    "rgb_light": {
+      "command_topic": "home/actuators/lights/rgb",
+      "state_topic": "home/actuators/lights/rgb/state",
+      "actions": ["on", "off", "brightness <0-100>", "color <#RRGGBB>"]
+    },
+    "buzzer": {
+      "command_topic": "home/actuators/buzzer",
+      "state_topic": "home/actuators/buzzer/state",
+      "actions": ["on", "off"]
+    },
+    "garage": {
+      "command_topic": "home/actuators/motors/garage",
+      "state_topic": "home/actuators/motors/garage/state",
+      "actions": ["open", "close"]
+    },
+    "window": {
+      "command_topic": "home/actuators/motors/frontwindow",
+      "state_topic": "home/actuators/motors/frontwindow/state",
+      "actions": ["open", "close"]
+    },
+    "door": {
+      "command_topic": "home/actuators/motors/door",
+      "state_topic": "home/actuators/motors/door/state",
+      "actions": ["open", "close"]
+    },
+    "gate": {
+      "command_topic": "home/actuators/motors/gate",
+      "state_topic": "home/actuators/motors/gate/state",
+      "actions": ["open", "close"]
+    }
+  },
+  "sensors": {
+    "temperature": {
+      "topic": "home/sensors/temp"
+    },
+    "humidity": {
+      "topic": "home/sensors/humidity"
+    },
+    "gas": {
+      "topic": "home/sensors/gas"
+    },
+    "flame": {
+      "topic": "home/sensors/flame"
+    },
+    "ldr": {
+      "topic": "home/sensors/ldr"
+    },
+    "rain": {
+      "topic": "home/sensors/rain"
+    },
+    "voltage": {
+      "topic": "home/sensors/voltage"
+    },
+    "current": {
+      "topic": "home/sensors/current"
+    }
+  }
+}

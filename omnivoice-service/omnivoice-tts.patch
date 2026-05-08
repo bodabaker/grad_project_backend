@@ -1,0 +1,2650 @@
+diff --git a/src/omnivoice.cpp b/src/omnivoice.cpp
+index 0aecedd..ea1a384 100644
+--- a/src/omnivoice.cpp
++++ b/src/omnivoice.cpp
+@@ -102,10 +102,12 @@ void ov_audio_free(struct ov_audio * a) {
+ }
+ 
+ void ov_init_default_params(struct ov_init_params * p) {
+-    p->model_path = nullptr;
+-    p->codec_path = nullptr;
+-    p->use_fa     = true;
+-    p->clamp_fp16 = false;
++    p->model_path     = nullptr;
++    p->codec_path     = nullptr;
++    p->use_fa         = true;
++    p->clamp_fp16     = false;
++    p->offload_encode = false;
++    p->skip_encode    = false;
+ }
+ 
+ void ov_tts_default_params(struct ov_tts_params * p) {
+@@ -180,7 +182,8 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
+     }
+ 
+     if (params->codec_path) {
+-        if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp)) {
++        ggml_backend_t enc_backend = params->offload_encode ? ov->bp.cpu_backend : NULL;
++        if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp, enc_backend, params->skip_encode)) {
+             ov_set_error("ov_init : pipeline_codec_load failed for '%s'", params->codec_path);
+             pipeline_tts_free(&ov->pt);
+             backend_release(ov->bp.backend, ov->bp.cpu_backend);
+@@ -231,4 +234,58 @@ int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec)
+     return pipeline_tts_duration_sec_to_tokens(&ov->pc, duration_sec);
+ }
+ 
++
++int ov_encode_ref(struct ov_context *  ov,
++                  const float *        audio_24k,
++                  int                  n_samples,
++                  int32_t **           tokens_out,
++                  int *                ref_T_out) {
++    if (!ov || !tokens_out || !ref_T_out) {
++        if (tokens_out) *tokens_out = nullptr;
++        if (ref_T_out) *ref_T_out = 0;
++        return 0;
++    }
++    if (!ov->codec_loaded) {
++        ov_set_error("ov_encode_ref : codec not loaded");
++        *tokens_out = nullptr;
++        *ref_T_out = 0;
++        return 0;
++    }
++    if (!audio_24k || n_samples <= 0) {
++        ov_set_error("ov_encode_ref : audio_24k is NULL or n_samples <= 0");
++        *tokens_out = nullptr;
++        *ref_T_out = 0;
++        return 0;
++    }
++
++    int n_aligned = (n_samples / ov->pc.hop_length) * ov->pc.hop_length;
++    std::vector<int32_t> codes = pipeline_codec_encode(&ov->pc, audio_24k, n_aligned, nullptr);
++    if (codes.empty()) {
++        ov_set_error("ov_encode_ref : pipeline_codec_encode failed");
++        *tokens_out = nullptr;
++        *ref_T_out = 0;
++        return 0;
++    }
++
++    const int K = ov->pt.lm.num_audio_codebook;
++    int T = (int) codes.size() / K;
++    int32_t * buf = (int32_t *) std::malloc(codes.size() * sizeof(int32_t));
++    if (!buf) {
++        ov_set_error("ov_encode_ref : malloc failed");
++        *tokens_out = nullptr;
++        *ref_T_out = 0;
++        return 0;
++    }
++    std::memcpy(buf, codes.data(), codes.size() * sizeof(int32_t));
++    *tokens_out = buf;
++    *ref_T_out = T;
++    return (int) codes.size();
++}
++
++void ov_encoded_ref_free(int32_t * tokens) {
++    if (tokens) {
++        std::free(tokens);
++    }
++}
++
+ }  // extern "C"
+new file mode 100644
+index 0000000..0aecedd
+--- /dev/null
++++ b/src/omnivoice.cpp.orig
+@@ -0,0 +1,234 @@
++// omnivoice.cpp: public ABI implementation.
++//
++// Every entry declared in omnivoice.h lives here under one extern "C" block
++// so the symbols carry C linkage and are linkable from C, Rust, Go, Python
++// ctypes and any other binding generator. The struct ov_context opaque
++// handle owns one BackendPair, one PipelineTTS, one PipelineCodec
++// (optional), one BPETokenizer and one VoiceDesign instance. ov_init walks
++// the load chain in dependency order and unwinds whatever it already
++// allocated when any step fails. ov_free mirrors that order in reverse.
++
++#include "omnivoice.h"
++
++#include "backend.h"
++#include "bpe.h"
++#include "ov-error.h"
++#include "pipeline-codec.h"
++#include "pipeline-tts.h"
++#include "version.h"
++#include "voice-design.h"
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++// Internal definition of the opaque handle. C++ types are fine here
++// because nothing in this struct ever crosses the public ABI boundary :
++// callers only ever see `struct ov_context *`.
++struct ov_context {
++    BackendPair   bp;
++    PipelineTTS   pt;
++    PipelineCodec pc;
++    BPETokenizer  tok;
++    VoiceDesign   vd;
++    bool          codec_loaded;
++};
++
++// Thread-local backing store for ov_last_error(). std::string sized once
++// per thread, grows on demand, never freed across calls : the std runtime
++// reclaims it on thread exit. An empty string means "no error recorded on
++// this thread yet", which ov_last_error() exposes as "".
++static thread_local std::string g_last_error;
++
++void ov_set_error_v(const char * fmt, va_list ap) {
++    if (!fmt) {
++        g_last_error.clear();
++        return;
++    }
++    // Two-pass vsnprintf : first call sizes the buffer, second writes the
++    // message. va_copy keeps the original ap valid for the second pass.
++    va_list ap2;
++    va_copy(ap2, ap);
++    int needed = std::vsnprintf(nullptr, 0, fmt, ap2);
++    va_end(ap2);
++    if (needed < 0) {
++        g_last_error = "ov_set_error : vsnprintf failed";
++        return;
++    }
++    g_last_error.resize(static_cast<size_t>(needed));
++    std::vsnprintf(g_last_error.data(), static_cast<size_t>(needed) + 1, fmt, ap);
++}
++
++void ov_set_error(const char * fmt, ...) {
++    va_list ap;
++    va_start(ap, fmt);
++    ov_set_error_v(fmt, ap);
++    va_end(ap);
++}
++
++extern "C" {
++
++const char * ov_version(void) {
++    // Built once at first call. The C++11 magic static guarantees the
++    // initialiser runs exactly once across threads.
++    static const std::string s = [] {
++        char buf[128];
++        std::snprintf(buf, sizeof(buf), "%d.%d.%d (%s)", OV_VERSION_MAJOR, OV_VERSION_MINOR, OV_VERSION_PATCH,
++                      OMNIVOICE_VERSION);
++        return std::string(buf);
++    }();
++    return s.c_str();
++}
++
++const char * ov_last_error(void) {
++    // c_str() on an empty std::string is guaranteed to point to a NUL
++    // byte by C++11, so callers never have to NULL-check the result.
++    return g_last_error.c_str();
++}
++
++void ov_audio_free(struct ov_audio * a) {
++    if (!a) {
++        return;
++    }
++    if (a->samples) {
++        std::free(a->samples);
++    }
++    a->samples     = nullptr;
++    a->n_samples   = 0;
++    a->sample_rate = 0;
++    a->channels    = 0;
++}
++
++void ov_init_default_params(struct ov_init_params * p) {
++    p->model_path = nullptr;
++    p->codec_path = nullptr;
++    p->use_fa     = true;
++    p->clamp_fp16 = false;
++}
++
++void ov_tts_default_params(struct ov_tts_params * p) {
++    p->text                    = nullptr;
++    p->lang                    = nullptr;
++    p->instruct                = nullptr;
++    p->T_override              = 0;
++    p->chunk_duration_sec      = 15.0f;
++    p->chunk_threshold_sec     = 30.0f;
++    p->denoise                 = true;
++    p->preprocess_prompt       = true;
++    p->mg_num_step             = 32;
++    p->mg_guidance_scale       = 2.0f;
++    p->mg_t_shift              = 0.1f;
++    p->mg_layer_penalty_factor = 5.0f;
++    p->mg_position_temperature = 5.0f;
++    p->mg_class_temperature    = 0.0f;
++    p->mg_seed                 = 42;
++    p->ref_audio_tokens        = nullptr;
++    p->ref_T                   = 0;
++    p->ref_audio_24k           = nullptr;
++    p->ref_n_samples           = 0;
++    p->ref_text                = nullptr;
++    p->dump_dir                = nullptr;
++    p->cancel                  = nullptr;
++    p->cancel_user_data        = nullptr;
++}
++
++struct ov_context * ov_init(const struct ov_init_params * params) {
++    if (!params || !params->model_path) {
++        ov_set_error("ov_init : params or model_path is NULL");
++        std::fprintf(stderr, "[OmniVoice] ERROR: ov_init requires a model_path\n");
++        return nullptr;
++    }
++
++    std::fprintf(stderr, "[OmniVoice] omnivoice.cpp %s\n", ov_version());
++
++    // new ov_context() value-initialises every field : POD aggregates
++    // (BackendPair, PipelineTTS, PipelineCodec) are zero-init, std
++    // containers in BPETokenizer construct empty, codec_loaded falls to
++    // false. Only VoiceDesign needs explicit population below.
++    ov_context * ov = new ov_context();
++
++    voice_design_init(&ov->vd);
++
++    // Backend init is shared (refcounted) across modules in the same
++    // binary, so ov_init / ov_free pairs balance the refcount cleanly.
++    ov->bp = backend_init("LM");
++    if (!ov->bp.backend) {
++        ov_set_error("ov_init : backend_init failed (no GGML backend available)");
++        delete ov;
++        return nullptr;
++    }
++
++    if (!pipeline_tts_load(&ov->pt, params->model_path, ov->bp, params->use_fa, params->clamp_fp16)) {
++        ov_set_error("ov_init : pipeline_tts_load failed for '%s'", params->model_path);
++        backend_release(ov->bp.backend, ov->bp.cpu_backend);
++        delete ov;
++        return nullptr;
++    }
++
++    // BPE tokenizer payload lives inside the same LM GGUF as the weights.
++    // Load the base vocab + the OmniVoice-specific special tokens in one
++    // shot.
++    if (!load_bpe_from_gguf(&ov->tok, params->model_path) ||
++        !bpe_load_omnivoice_specials(&ov->tok, params->model_path)) {
++        ov_set_error("ov_init : BPE / OmniVoice specials load failed for '%s'", params->model_path);
++        pipeline_tts_free(&ov->pt);
++        backend_release(ov->bp.backend, ov->bp.cpu_backend);
++        delete ov;
++        return nullptr;
++    }
++
++    if (params->codec_path) {
++        if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp)) {
++            ov_set_error("ov_init : pipeline_codec_load failed for '%s'", params->codec_path);
++            pipeline_tts_free(&ov->pt);
++            backend_release(ov->bp.backend, ov->bp.cpu_backend);
++            delete ov;
++            return nullptr;
++        }
++        ov->codec_loaded = true;
++    }
++
++    return ov;
++}
++
++void ov_free(struct ov_context * ov) {
++    if (!ov) {
++        return;
++    }
++    if (ov->codec_loaded) {
++        pipeline_codec_free(&ov->pc);
++    }
++    pipeline_tts_free(&ov->pt);
++    backend_release(ov->bp.backend, ov->bp.cpu_backend);
++    delete ov;
++}
++
++enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out) {
++    if (!ov || !params || !out) {
++        ov_set_error("ov_synthesize : ov / params / out is NULL");
++        if (out) {
++            ov_audio_free(out);
++        }
++        return OV_STATUS_INVALID_PARAMS;
++    }
++    if (!ov->codec_loaded) {
++        ov_set_error("ov_synthesize : codec not loaded (pass codec_path to ov_init)");
++        ov_audio_free(out);
++        std::fprintf(stderr, "[OmniVoice] ERROR: ov_synthesize requires a codec-loaded handle\n");
++        return OV_STATUS_INVALID_PARAMS;
++    }
++    return pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out);
++}
++
++int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec) {
++    if (!ov || !ov->codec_loaded) {
++        ov_set_error("ov_duration_sec_to_tokens : codec not loaded");
++        std::fprintf(stderr, "[OmniVoice] ERROR: ov_duration_sec_to_tokens requires a codec-loaded handle\n");
++        return 1;
++    }
++    return pipeline_tts_duration_sec_to_tokens(&ov->pc, duration_sec);
++}
++
++}  // extern "C"
+diff --git a/src/omnivoice.h b/src/omnivoice.h
+index e08ba46..6caf79f 100644
+--- a/src/omnivoice.h
++++ b/src/omnivoice.h
+@@ -104,6 +104,8 @@ struct ov_init_params {
+     const char * codec_path;
+     bool         use_fa;
+     bool         clamp_fp16;
++    bool         offload_encode;
++    bool         skip_encode;
+ };
+ 
+ // Initialise to the standard defaults : codec_path NULL (caller must set
+@@ -195,6 +197,22 @@ OV_API void ov_tts_default_params(struct ov_tts_params * p);
+ // `out` empty. Requires a codec-loaded handle.
+ OV_API enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out);
+ 
++
++// Encode a reference WAV into audio tokens for voice cloning. The caller
++// owns the returned buffer (free with ov_encoded_ref_free). Returns the
++// number of frames (*ref_T_out) and fills *tokens_out with row-major
++// [K, ref_T] i32 codes. Returns 0 on failure. Requires a codec-loaded handle.
++// Use this to pre-encode references once and pass the tokens to ov_synthesize
++// via params.ref_audio_tokens / params.ref_T for subsequent requests.
++OV_API int ov_encode_ref(struct ov_context *  ov,
++                         const float *        audio_24k,
++                         int                  n_samples,
++                         int32_t **           tokens_out,
++                         int *                ref_T_out);
++
++// Free a buffer allocated by ov_encode_ref. Safe on NULL.
++OV_API void ov_encoded_ref_free(int32_t * tokens);
++
+ // Convert a duration in seconds to a frame count using the bundled codec
+ // frame rate (sample_rate / hop_length). Clamps to a minimum of one
+ // frame. Requires a codec-loaded handle.
+new file mode 100644
+index 0000000..e08ba46
+--- /dev/null
++++ b/src/omnivoice.h.orig
+@@ -0,0 +1,205 @@
++#pragma once
++// omnivoice.h: public ABI for omnivoice.cpp.
++//
++// Single-header public API. Pure C99, consumable from C and C++ alike.
++// Bindings (Python ctypes, Rust bindgen, Go cgo) parse this file directly.
++// Style follows whisper.h / llama.h : extern "C" linkage on every entry,
++// POD structs only, const char * UTF-8 strings, ov_status enum returns.
++//
++// The opaque ov_context handle aggregates every module the synthesis path
++// needs (LM weights, audio tokenizer codec, BPE tokenizer, voice-design
++// vocabulary, GGML backend pair). One init, one free, one synthesize call
++// covers the full TTS path. The lower-level pipeline_*_load /
++// pipeline_*_free entries declared in pipeline-tts.h / pipeline-codec.h
++// stay available for the debug paths that need partial init, but they
++// are intentionally not part of this public ABI.
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Symbol visibility. Three Windows cases : building the SHARED target
++// (OMNIVOICE_BUILD set, dllexport), consuming the SHARED target from
++// outside (nothing set, dllimport), consuming the STATIC archive
++// (OMNIVOICE_STATIC set by the static target's INTERFACE definitions,
++// empty so the linker resolves the symbol directly without dllimport).
++// On GCC/Clang the default-visibility attribute is harmless on static
++// builds and required on shared builds.
++#if defined(_WIN32) || defined(__CYGWIN__)
++#    if defined(OMNIVOICE_STATIC)
++#        define OV_API
++#    elif defined(OMNIVOICE_BUILD)
++#        define OV_API __declspec(dllexport)
++#    else
++#        define OV_API __declspec(dllimport)
++#    endif
++#elif defined(__GNUC__) || defined(__clang__)
++#    define OV_API __attribute__((visibility("default")))
++#else
++#    define OV_API
++#endif
++
++// Library API/ABI version. Bumped manually : MAJOR on breaking changes,
++// MINOR on additive changes, PATCH on bug fixes. The runtime ov_version()
++// returns this number plus the git hash and commit date embedded by
++// version.cmake at build time.
++#define OV_VERSION_MAJOR 0
++#define OV_VERSION_MINOR 1
++#define OV_VERSION_PATCH 0
++
++// Returns a static string of the form "MAJOR.MINOR.PATCH (git-hash, date)".
++// Safe to call from any thread, no allocation. Pointer stays valid for the
++// process lifetime.
++OV_API const char * ov_version(void);
++
++// Status code returned by every fallible entry. OV_STATUS_OK is always
++// zero so `if (rc)` reads as `if (rc != OV_STATUS_OK)`.
++enum ov_status {
++    OV_STATUS_OK               = 0,
++    OV_STATUS_INVALID_PARAMS   = -1,
++    OV_STATUS_INSTRUCT_INVALID = -2,
++    OV_STATUS_GENERATE_FAILED  = -3,
++    OV_STATUS_OOM              = -4,
++    OV_STATUS_CANCELLED        = -5,
++};
++
++// Returns the last error message produced on the calling thread by any
++// ov_* entry, as a NUL-terminated UTF-8 string. errno-style semantics : the
++// pointer is only meaningful right after a failure (ov_init returning NULL,
++// or any ov_* entry returning a negative ov_status) ; calling it after a
++// successful entry yields the previous message or an empty string. Storage
++// is thread-local so two threads running ov_synthesize concurrently never
++// race on each other's diagnostics. The pointer stays valid until the next
++// failing ov_* entry on the same thread.
++OV_API const char * ov_last_error(void);
++
++// Output audio buffer. Plain POD : the samples pointer is malloc-allocated
++// by ov_synthesize, owned by the struct, released by ov_audio_free. Do not
++// free samples directly nor reassign without freeing first. Zero-initialise
++// before the first use : `struct ov_audio a = {0};`.
++struct ov_audio {
++    float * samples;      // mono PCM, malloc-allocated
++    int     n_samples;    // length in samples
++    int     sample_rate;  // 24000 for OmniVoice
++    int     channels;     // 1 (mono)
++};
++
++// Release the samples buffer and reset the struct to empty. Safe on a
++// zero-initialised struct (no double free, no NULL deref).
++OV_API void ov_audio_free(struct ov_audio * a);
++
++// Opaque handle. Definition lives in omnivoice.cpp. Use ov_init / ov_free.
++struct ov_context;
++
++// Initialisation parameters. model_path is required (the LM GGUF). When
++// codec_path is NULL the codec module is skipped and ov_synthesize fails
++// immediately with OV_STATUS_INVALID_PARAMS. use_fa enables flash
++// attention when a GPU backend is present ; clamp_fp16 guards FP16
++// matmul accumulation on sub-Ampere CUDA.
++struct ov_init_params {
++    const char * model_path;
++    const char * codec_path;
++    bool         use_fa;
++    bool         clamp_fp16;
++};
++
++// Initialise to the standard defaults : codec_path NULL (caller must set
++// it for synthesis), use_fa true, clamp_fp16 false.
++OV_API void ov_init_default_params(struct ov_init_params * p);
++
++// Allocate every module described by params. Returns NULL on any failure
++// after releasing whatever it has allocated so far. The returned handle
++// owns its GGML backend pair and must be released with ov_free.
++OV_API struct ov_context * ov_init(const struct ov_init_params * params);
++
++// Release every module owned by the handle and free the handle itself.
++// Safe on NULL.
++OV_API void ov_free(struct ov_context * ov);
++
++// Cooperative cancellation callback. Returns true to request the
++// synthesis to abort. Polled between chunks of long-form output, so the
++// cancel granularity is roughly chunk_duration_sec.
++typedef bool (*ov_cancel_cb)(void * user_data);
++
++// Synthesis parameters. Strings are NULL-terminated UTF-8 ; NULL maps to
++// empty. Reference inputs are mutually exclusive : either pre-encoded
++// tokens [K, ref_T] OR raw 24 kHz mono samples. Passing both fails with
++// OV_STATUS_INVALID_PARAMS. The MaskGIT sampler config is flattened
++// directly into this struct (seven mg_* fields) to keep it fully POD.
++struct ov_tts_params {
++    // Input text and language hint. lang accepts "" (auto), "en" or "zh"
++    // matching the upstream OmniVoice convention. instruct is the raw
++    // attribute string ("female young adult moderate"), validated and
++    // normalised internally against the bundled VoiceDesign.
++    const char * text;
++    const char * lang;
++    const char * instruct;
++
++    // Duration control. T_override > 0 forces single-shot at the exact
++    // frame count and bypasses both the estimator and the chunker.
++    // T_override == 0 lets the pipeline decide between single-shot and
++    // chunked output. chunk_duration_sec <= 0 disables chunking entirely.
++    int   T_override;
++    float chunk_duration_sec;
++    float chunk_threshold_sec;
++
++    // Generation flags. denoise toggles the <|denoise|> marker emitted
++    // only when a reference is present. preprocess_prompt mirrors the
++    // upstream Python flag : when true, applies add_punctuation to
++    // ref_text and silence-trims the raw reference waveform.
++    bool denoise;
++    bool preprocess_prompt;
++
++    // MaskGIT sampler config. Defaults match the reference :
++    // num_step=32, guidance_scale=2.0, t_shift=0.1,
++    // layer_penalty_factor=5.0, position_temperature=5.0,
++    // class_temperature=0.0, seed=42.
++    int      mg_num_step;
++    float    mg_guidance_scale;
++    float    mg_t_shift;
++    float    mg_layer_penalty_factor;
++    float    mg_position_temperature;
++    float    mg_class_temperature;
++    uint64_t mg_seed;
++
++    // Optional voice reference. Two mutually exclusive ways to supply it.
++    const int32_t * ref_audio_tokens;
++    int             ref_T;
++    const float *   ref_audio_24k;
++    int             ref_n_samples;
++    const char *    ref_text;
++
++    // Intermediate tensor dump directory. NULL disables dumps.
++    const char * dump_dir;
++
++    // Cooperative cancellation. cancel NULL disables the feature.
++    // cancel_user_data is forwarded to the callback verbatim.
++    ov_cancel_cb cancel;
++    void *       cancel_user_data;
++};
++
++// Initialise to the standard defaults. Strings NULL, T_override 0,
++// chunk_duration_sec 15, chunk_threshold_sec 30, denoise true,
++// preprocess_prompt true, MaskGIT defaults as above, every reference
++// pointer NULL, dump_dir NULL, cancel NULL.
++OV_API void ov_tts_default_params(struct ov_tts_params * p);
++
++// Run the full TTS synthesis. Resolves the instruct against the bundled
++// VoiceDesign vocabulary, picks between single-shot, chunked auto-voice
++// and voice-cloning paths from the params struct, and fills `out` with
++// mono float PCM at 24 kHz. Returns OV_STATUS_OK on success ; on any
++// failure returns a negative ov_status describing the cause and leaves
++// `out` empty. Requires a codec-loaded handle.
++OV_API enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out);
++
++// Convert a duration in seconds to a frame count using the bundled codec
++// frame rate (sample_rate / hop_length). Clamps to a minimum of one
++// frame. Requires a codec-loaded handle.
++OV_API int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/pipeline-codec.cpp b/src/pipeline-codec.cpp
+index db2ba9a..f8827b7 100644
+--- a/src/pipeline-codec.cpp
++++ b/src/pipeline-codec.cpp
+@@ -28,11 +28,13 @@
+ #include <cstdlib>
+ #include <cstring>
+ 
+-bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp) {
++bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp,
++                         ggml_backend_t enc_backend, bool skip_encode) {
+     *pc                    = {};
+     pc->bp                 = bp;
+     pc->backend            = bp.backend;
+     ggml_backend_t backend = bp.backend;
++    const bool offload_enc = !skip_encode && (enc_backend != NULL && enc_backend != backend);
+ 
+     if (!gf_load(&pc->gguf, gguf_path)) {
+         return false;
+@@ -46,9 +48,8 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
+         return false;
+     }
+ 
+-    // RVQ : 8 codebooks * 5 tensors (embed + project_in w/b + project_out w/b)
+-    // = 40, plus fc2 weight + bias and fc weight + bias = 44. We pad to 64 for headroom.
+-    wctx_init(&pc->wctx, 64);
++    const int wctx_tensors = skip_encode ? 48 : (offload_enc ? 48 : 64);
++    wctx_init(&pc->wctx, wctx_tensors);
+ 
+     if (!rvq_load(&pc->rvq, &pc->wctx, pc->gguf)) {
+         wctx_free(&pc->wctx);
+@@ -66,123 +67,133 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
+         return false;
+     }
+ 
+-    pc->fc_w = gf_load_tensor(&pc->wctx, pc->gguf, "fc.weight");
+-    pc->fc_b = gf_load_tensor_f32(&pc->wctx, pc->gguf, "fc.bias");
+-    if (!pc->fc_w || !pc->fc_b) {
+-        fprintf(stderr, "[PipelineCodec] FATAL: missing fc.weight or fc.bias\n");
+-        wctx_free(&pc->wctx);
+-        gf_close(&pc->gguf);
+-        return false;
++    if (!skip_encode) {
++        if (offload_enc) {
++            wctx_init(&pc->enc_wctx, 4);
++            pc->fc_w = gf_load_tensor(&pc->enc_wctx, pc->gguf, "fc.weight");
++            pc->fc_b = gf_load_tensor_f32(&pc->enc_wctx, pc->gguf, "fc.bias");
++        } else {
++            pc->fc_w = gf_load_tensor(&pc->wctx, pc->gguf, "fc.weight");
++            pc->fc_b = gf_load_tensor_f32(&pc->wctx, pc->gguf, "fc.bias");
++        }
++        if (!pc->fc_w || !pc->fc_b) {
++            fprintf(stderr, "[PipelineCodec] FATAL: missing fc.weight or fc.bias\n");
++            wctx_free(&pc->enc_wctx);
++            wctx_free(&pc->wctx);
++            gf_close(&pc->gguf);
++            return false;
++        }
+     }
+ 
+     if (!wctx_alloc(&pc->wctx, backend)) {
++        wctx_free(&pc->enc_wctx);
+         wctx_free(&pc->wctx);
+         gf_close(&pc->gguf);
+         return false;
+     }
++    if (offload_enc) {
++        if (!wctx_alloc(&pc->enc_wctx, enc_backend)) {
++            wctx_free(&pc->enc_wctx);
++            wctx_free(&pc->wctx);
++            gf_close(&pc->gguf);
++            return false;
++        }
++    }
+ 
+-    // DAC has its own private weight ctx and applies per-tensor transforms
+-    // at load time (snake reciprocal, conv_t permutation) using gf_get_data
+-    // raw mmap pointers, so the GGUF mmap must remain open across this call.
+     if (!dac_load(&pc->dac, pc->gguf, backend)) {
++        wctx_free(&pc->enc_wctx);
+         wctx_free(&pc->wctx);
+         gf_close(&pc->gguf);
+         return false;
+     }
+ 
+-    // DAC encoder mirrors the same private weight ctx pattern. It is the
+-    // counterpart of the decoder used during the encode side of the codec
+-    // pipeline (waveform -> latent), and reuses the same load helpers.
+-    if (!dac_enc_load(&pc->dac_enc, pc->gguf, backend)) {
+-        dac_free(&pc->dac);
+-        wctx_free(&pc->wctx);
+-        gf_close(&pc->gguf);
+-        return false;
+-    }
++    if (!skip_encode) {
++        ggml_backend_t enc_b = offload_enc ? enc_backend : backend;
+ 
+-    // SemanticEncoder refines the HuBERT semantic features before the joint
+-    // fc + RVQ encode stage. Its private weight ctx mirrors the DAC pattern
+-    // for consistency, even though it has no per-tensor transforms.
+-    if (!sem_enc_load(&pc->sem_enc, pc->gguf, backend)) {
+-        dac_enc_free(&pc->dac_enc);
+-        dac_free(&pc->dac);
+-        wctx_free(&pc->wctx);
+-        gf_close(&pc->gguf);
+-        return false;
+-    }
++        if (!dac_enc_load(&pc->dac_enc, pc->gguf, enc_b)) {
++            dac_free(&pc->dac);
++            wctx_free(&pc->enc_wctx);
++            wctx_free(&pc->wctx);
++            gf_close(&pc->gguf);
++            return false;
++        }
+ 
+-    // HuBERT feature_extractor : 7 conv stack with GroupNorm on layer 0 and
+-    // GELU on every layer. Cumulative stride 320 over 16 kHz audio.
+-    if (!hubert_feat_load(&pc->hubert_feat, pc->gguf, backend)) {
+-        sem_enc_free(&pc->sem_enc);
+-        dac_enc_free(&pc->dac_enc);
+-        dac_free(&pc->dac);
+-        wctx_free(&pc->wctx);
+-        gf_close(&pc->gguf);
+-        return false;
+-    }
++        if (!sem_enc_load(&pc->sem_enc, pc->gguf, enc_b)) {
++            dac_enc_free(&pc->dac_enc);
++            dac_free(&pc->dac);
++            wctx_free(&pc->enc_wctx);
++            wctx_free(&pc->wctx);
++            gf_close(&pc->gguf);
++            return false;
++        }
+ 
+-    // HuBERT feature_projection : LN(512) + Linear(512, 768). Bridges the
+-    // feature_extractor (T fast layout) to the transformer encoder which
+-    // operates in C-first layout (C fast, T slow).
+-    if (!hubert_proj_load(&pc->hubert_proj, pc->gguf, backend)) {
+-        hubert_feat_free(&pc->hubert_feat);
+-        sem_enc_free(&pc->sem_enc);
+-        dac_enc_free(&pc->dac_enc);
+-        dac_free(&pc->dac);
+-        wctx_free(&pc->wctx);
+-        gf_close(&pc->gguf);
+-        return false;
+-    }
++        if (!hubert_feat_load(&pc->hubert_feat, pc->gguf, enc_b)) {
++            sem_enc_free(&pc->sem_enc);
++            dac_enc_free(&pc->dac_enc);
++            dac_free(&pc->dac);
++            wctx_free(&pc->enc_wctx);
++            wctx_free(&pc->wctx);
++            gf_close(&pc->gguf);
++            return false;
++        }
+ 
+-    // HuBERT encoder init block : grouped pos_conv_embed (residual add) +
+-    // first LayerNorm. Sits between feature_projection and the 12-layer stack.
+-    if (!hubert_enc_init_load(&pc->hubert_enc_init, pc->gguf, backend)) {
+-        hubert_proj_free(&pc->hubert_proj);
+-        hubert_feat_free(&pc->hubert_feat);
+-        sem_enc_free(&pc->sem_enc);
+-        dac_enc_free(&pc->dac_enc);
+-        dac_free(&pc->dac);
+-        wctx_free(&pc->wctx);
+-        gf_close(&pc->gguf);
+-        return false;
+-    }
++        if (!hubert_proj_load(&pc->hubert_proj, pc->gguf, enc_b)) {
++            hubert_feat_free(&pc->hubert_feat);
++            sem_enc_free(&pc->sem_enc);
++            dac_enc_free(&pc->dac_enc);
++            dac_free(&pc->dac);
++            wctx_free(&pc->enc_wctx);
++            wctx_free(&pc->wctx);
++            gf_close(&pc->gguf);
++            return false;
++        }
+ 
+-    // HuBERT transformer encoder : 12 Post-LN layers loaded in sequence. Each
+-    // layer owns its own backend buffer for clean lifecycle. On failure at
+-    // index i, we unwind layers [0, i) before the rest of the chain.
+-    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+-        if (!hubert_layer_load(&pc->hubert_layers[i], pc->gguf, backend, i)) {
+-            for (int j = 0; j < i; j++) {
+-                hubert_layer_free(&pc->hubert_layers[j]);
+-            }
+-            hubert_enc_init_free(&pc->hubert_enc_init);
++        if (!hubert_enc_init_load(&pc->hubert_enc_init, pc->gguf, enc_b)) {
+             hubert_proj_free(&pc->hubert_proj);
+             hubert_feat_free(&pc->hubert_feat);
+             sem_enc_free(&pc->sem_enc);
+             dac_enc_free(&pc->dac_enc);
+             dac_free(&pc->dac);
++            wctx_free(&pc->enc_wctx);
+             wctx_free(&pc->wctx);
+             gf_close(&pc->gguf);
+             return false;
+         }
++
++        for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
++            if (!hubert_layer_load(&pc->hubert_layers[i], pc->gguf, enc_b, i)) {
++                for (int j = 0; j < i; j++) {
++                    hubert_layer_free(&pc->hubert_layers[j]);
++                }
++                hubert_enc_init_free(&pc->hubert_enc_init);
++                hubert_proj_free(&pc->hubert_proj);
++                hubert_feat_free(&pc->hubert_feat);
++                sem_enc_free(&pc->sem_enc);
++                dac_enc_free(&pc->dac_enc);
++                dac_free(&pc->dac);
++                wctx_free(&pc->enc_wctx);
++                wctx_free(&pc->wctx);
++                gf_close(&pc->gguf);
++                return false;
++            }
++        }
++
++        size_t stack_bytes = 0;
++        for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
++            stack_bytes += ggml_backend_buffer_get_size(pc->hubert_layers[i].weight_buf);
++        }
++        fprintf(stderr, "[HuBERT-Stack] Loaded: %d layers, hidden=%d heads=%d ffn=%d, weights %.1f MB on %s\n", HUBERT_NUM_LAYERS,
++                HUBERT_HIDDEN, HUBERT_NUM_HEADS, HUBERT_FFN_INNER, (float) stack_bytes / (1024 * 1024),
++                offload_enc ? "CPU" : ggml_backend_name(enc_b));
++    } else {
++        fprintf(stderr, "[PipelineCodec] Skipping encode-path components (decode-only mode)\n");
+     }
+-    size_t stack_bytes = 0;
+-    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+-        stack_bytes += ggml_backend_buffer_get_size(pc->hubert_layers[i].weight_buf);
+-    }
+-    fprintf(stderr, "[HuBERT-Stack] Loaded: %d layers, hidden=%d heads=%d ffn=%d, weights %.1f MB\n", HUBERT_NUM_LAYERS,
+-            HUBERT_HIDDEN, HUBERT_NUM_HEADS, HUBERT_FFN_INNER, (float) stack_bytes / (1024 * 1024));
+ 
+-    // All weights are now on the backend. The mmap is no longer needed.
+     gf_close(&pc->gguf);
+ 
+-    fprintf(stderr, "[PipelineCodec] Loaded codec: sr=%d hop=%d backend=%s\n", pc->sample_rate, pc->hop_length,
+-            ggml_backend_name(backend));
+-    // Scheduler : routes ops the GPU backend cannot run (e.g. K-quant
+-    // get_rows on CUDA) to the CPU backend. 4096 nodes covers HuBERT 12L
+-    // + DAC encoder + DAC decoder graphs.
+-    pc->sched = backend_sched_new(bp, 4096);
++    fprintf(stderr, "[PipelineCodec] Loaded codec: sr=%d hop=%d backend=%s%s\n", pc->sample_rate, pc->hop_length,
++            ggml_backend_name(backend), skip_encode ? " (decode-only)" : (offload_enc ? " (encode-path offloaded to CPU)" : ""));
++    pc->sched = backend_sched_new(bp, skip_encode ? 2048 : 4096);
+     if (!pc->sched) {
+         pipeline_codec_free(pc);
+         return false;
+@@ -544,6 +555,7 @@ void pipeline_codec_free(PipelineCodec * pc) {
+     sem_enc_free(&pc->sem_enc);
+     dac_enc_free(&pc->dac_enc);
+     dac_free(&pc->dac);
++    wctx_free(&pc->enc_wctx);
+     wctx_free(&pc->wctx);
+     *pc = {};
+ }
+new file mode 100644
+index 0000000..db2ba9a
+--- /dev/null
++++ b/src/pipeline-codec.cpp.orig
+@@ -0,0 +1,791 @@
++// pipeline-codec.cpp : decode-side audio tokenizer pipeline.
++//
++// Graph (fast axis ne[0] explicit) :
++//   codes      [T, 8]      i32   ->  rvq_decode_graph
++//   latent     [1024, T]   f32   <- rvq output, channels-first natively
++//   h          [256, T]    f32   <- mul_mat(fc2_w, latent), ne=(M, N)
++//                                       M = fc2_w.ne[1] = 256 (out)
++//                                       N = latent.ne[1] = T
++//   h          [256, T]    f32   <- + fc2_b (1D ne=256, broadcasts on ne[1]=T)
++//   h          [T, 256]    f32   <- cont(transpose) for DAC conv input
++//   audio      [T*960, 1]  f32   <- dac_build_graph
++//   audio_1d   [T*960]     f32   <- view_1d
++//
++// ggml_mul_mat(A, B) requires A.ne[0]==B.ne[0]==K and produces ne=(M=A.ne[1],
++// N=B.ne[1]) with M fast. So fc2 produces channels-first like RVQ, the bias
++// add uses the 1D broadcast on ne[1] just like RVQ's project_out_b, and we
++// transpose once before DAC because DAC's conv1d expects T fast.
++
++#include "pipeline-codec.h"
++
++#include "audio-resample.h"
++#include "debug.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp) {
++    *pc                    = {};
++    pc->bp                 = bp;
++    pc->backend            = bp.backend;
++    ggml_backend_t backend = bp.backend;
++
++    if (!gf_load(&pc->gguf, gguf_path)) {
++        return false;
++    }
++
++    pc->sample_rate = (int) gf_get_u32(pc->gguf, "omnivoice.sample_rate");
++    pc->hop_length  = (int) gf_get_u32(pc->gguf, "omnivoice.acoustic.hop_length");
++    if (pc->sample_rate == 0 || pc->hop_length == 0) {
++        fprintf(stderr, "[PipelineCodec] FATAL: missing sample_rate or hop_length in GGUF\n");
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // RVQ : 8 codebooks * 5 tensors (embed + project_in w/b + project_out w/b)
++    // = 40, plus fc2 weight + bias and fc weight + bias = 44. We pad to 64 for headroom.
++    wctx_init(&pc->wctx, 64);
++
++    if (!rvq_load(&pc->rvq, &pc->wctx, pc->gguf)) {
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    pc->fc2_w = gf_load_tensor(&pc->wctx, pc->gguf, "fc2.weight");
++    // F32 cast at load : ggml_add CUDA only accepts src1 in F32 or F16.
++    pc->fc2_b = gf_load_tensor_f32(&pc->wctx, pc->gguf, "fc2.bias");
++    if (!pc->fc2_w || !pc->fc2_b) {
++        fprintf(stderr, "[PipelineCodec] FATAL: missing fc2.weight or fc2.bias\n");
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    pc->fc_w = gf_load_tensor(&pc->wctx, pc->gguf, "fc.weight");
++    pc->fc_b = gf_load_tensor_f32(&pc->wctx, pc->gguf, "fc.bias");
++    if (!pc->fc_w || !pc->fc_b) {
++        fprintf(stderr, "[PipelineCodec] FATAL: missing fc.weight or fc.bias\n");
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    if (!wctx_alloc(&pc->wctx, backend)) {
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // DAC has its own private weight ctx and applies per-tensor transforms
++    // at load time (snake reciprocal, conv_t permutation) using gf_get_data
++    // raw mmap pointers, so the GGUF mmap must remain open across this call.
++    if (!dac_load(&pc->dac, pc->gguf, backend)) {
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // DAC encoder mirrors the same private weight ctx pattern. It is the
++    // counterpart of the decoder used during the encode side of the codec
++    // pipeline (waveform -> latent), and reuses the same load helpers.
++    if (!dac_enc_load(&pc->dac_enc, pc->gguf, backend)) {
++        dac_free(&pc->dac);
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // SemanticEncoder refines the HuBERT semantic features before the joint
++    // fc + RVQ encode stage. Its private weight ctx mirrors the DAC pattern
++    // for consistency, even though it has no per-tensor transforms.
++    if (!sem_enc_load(&pc->sem_enc, pc->gguf, backend)) {
++        dac_enc_free(&pc->dac_enc);
++        dac_free(&pc->dac);
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // HuBERT feature_extractor : 7 conv stack with GroupNorm on layer 0 and
++    // GELU on every layer. Cumulative stride 320 over 16 kHz audio.
++    if (!hubert_feat_load(&pc->hubert_feat, pc->gguf, backend)) {
++        sem_enc_free(&pc->sem_enc);
++        dac_enc_free(&pc->dac_enc);
++        dac_free(&pc->dac);
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // HuBERT feature_projection : LN(512) + Linear(512, 768). Bridges the
++    // feature_extractor (T fast layout) to the transformer encoder which
++    // operates in C-first layout (C fast, T slow).
++    if (!hubert_proj_load(&pc->hubert_proj, pc->gguf, backend)) {
++        hubert_feat_free(&pc->hubert_feat);
++        sem_enc_free(&pc->sem_enc);
++        dac_enc_free(&pc->dac_enc);
++        dac_free(&pc->dac);
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // HuBERT encoder init block : grouped pos_conv_embed (residual add) +
++    // first LayerNorm. Sits between feature_projection and the 12-layer stack.
++    if (!hubert_enc_init_load(&pc->hubert_enc_init, pc->gguf, backend)) {
++        hubert_proj_free(&pc->hubert_proj);
++        hubert_feat_free(&pc->hubert_feat);
++        sem_enc_free(&pc->sem_enc);
++        dac_enc_free(&pc->dac_enc);
++        dac_free(&pc->dac);
++        wctx_free(&pc->wctx);
++        gf_close(&pc->gguf);
++        return false;
++    }
++
++    // HuBERT transformer encoder : 12 Post-LN layers loaded in sequence. Each
++    // layer owns its own backend buffer for clean lifecycle. On failure at
++    // index i, we unwind layers [0, i) before the rest of the chain.
++    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
++        if (!hubert_layer_load(&pc->hubert_layers[i], pc->gguf, backend, i)) {
++            for (int j = 0; j < i; j++) {
++                hubert_layer_free(&pc->hubert_layers[j]);
++            }
++            hubert_enc_init_free(&pc->hubert_enc_init);
++            hubert_proj_free(&pc->hubert_proj);
++            hubert_feat_free(&pc->hubert_feat);
++            sem_enc_free(&pc->sem_enc);
++            dac_enc_free(&pc->dac_enc);
++            dac_free(&pc->dac);
++            wctx_free(&pc->wctx);
++            gf_close(&pc->gguf);
++            return false;
++        }
++    }
++    size_t stack_bytes = 0;
++    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
++        stack_bytes += ggml_backend_buffer_get_size(pc->hubert_layers[i].weight_buf);
++    }
++    fprintf(stderr, "[HuBERT-Stack] Loaded: %d layers, hidden=%d heads=%d ffn=%d, weights %.1f MB\n", HUBERT_NUM_LAYERS,
++            HUBERT_HIDDEN, HUBERT_NUM_HEADS, HUBERT_FFN_INNER, (float) stack_bytes / (1024 * 1024));
++
++    // All weights are now on the backend. The mmap is no longer needed.
++    gf_close(&pc->gguf);
++
++    fprintf(stderr, "[PipelineCodec] Loaded codec: sr=%d hop=%d backend=%s\n", pc->sample_rate, pc->hop_length,
++            ggml_backend_name(backend));
++    // Scheduler : routes ops the GPU backend cannot run (e.g. K-quant
++    // get_rows on CUDA) to the CPU backend. 4096 nodes covers HuBERT 12L
++    // + DAC encoder + DAC decoder graphs.
++    pc->sched = backend_sched_new(bp, 4096);
++    if (!pc->sched) {
++        pipeline_codec_free(pc);
++        return false;
++    }
++
++    return true;
++}
++
++std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int num_codebooks, int n_frames) {
++    if (num_codebooks != RVQ_NUM_CODEBOOKS) {
++        fprintf(stderr, "[PipelineCodec] FATAL: codes have %d codebooks, expected %d\n", num_codebooks,
++                RVQ_NUM_CODEBOOKS);
++        return {};
++    }
++    if (n_frames <= 0) {
++        fprintf(stderr, "[PipelineCodec] FATAL: n_frames must be > 0\n");
++        return {};
++    }
++
++    // Compute graph context : holds tensor descriptors for the forward pass.
++    // 4096 nodes leaves ample headroom (DAC alone has ~150 ops).
++    const int    n_max_nodes    = 4096;
++    const size_t graph_ctx_size = ggml_tensor_overhead() * n_max_nodes + ggml_graph_overhead_custom(n_max_nodes, false);
++
++    struct ggml_init_params gp   = { graph_ctx_size, NULL, /*no_alloc=*/true };
++    struct ggml_context *   gctx = ggml_init(gp);
++    if (!gctx) {
++        fprintf(stderr, "[PipelineCodec] FATAL: ggml_init failed for graph ctx\n");
++        return {};
++    }
++
++    // Input : codes [T, 8] i32, ne[0]=T fast
++    struct ggml_tensor * codes_in = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, n_frames, num_codebooks);
++    ggml_set_name(codes_in, "codes_in");
++    ggml_set_input(codes_in);
++
++    // RVQ : codes [T, 8] -> latent [1024, T]
++    struct ggml_tensor * latent = rvq_decode_graph(gctx, &pc->rvq, codes_in);
++    ggml_set_name(latent, "rvq_out");
++
++    // fc2 Linear via ggml_mul_mat. GGML convention :
++    //   A = fc2_w  ne=(K=1024, M=256)
++    //   B = latent ne=(K=1024, N=T)
++    //   result     ne=(M=256, N=T)        ne[0]=256=channels fast, ne[1]=T slow
++    struct ggml_tensor * h = ggml_mul_mat(gctx, pc->fc2_w, latent);
++
++    // 1D bias broadcast : fc2_b ne=(256) lines up with h.ne[0]=256, broadcasts
++    // across ne[1]=T. Same pattern as the RVQ project_out_b add.
++    h = ggml_add(gctx, h, pc->fc2_b);
++    ggml_set_name(h, "fc2_out");
++
++    // Stable reference for the optional dump : `h` is about to be reassigned
++    // by cont(transpose), and only the original fc2_out tensor will be marked
++    // as output. The post-transpose tensor would be reused by the gallocr
++    // once DAC consumes it.
++    struct ggml_tensor * fc2_out = h;
++
++    // Optional debug : keep RVQ and fc2 outputs alive across the graph compute
++    // so we can copy them back. Without this the gallocr is free to reuse
++    // their backing memory once consumed downstream.
++    const bool dump = std::getenv("OMNIVOICE_DUMP_STAGES") != NULL;
++    if (dump) {
++        ggml_set_output(latent);
++        ggml_set_output(fc2_out);
++    }
++
++    // DAC expects [T, IC=256] T fast (ggml_conv_1d input layout). Current shape
++    // is (256, T) so transpose and make contiguous before feeding the decoder.
++    h = ggml_cont(gctx, ggml_transpose(gctx, h));
++
++    // DAC decode -> [T*960, 1] f32
++    std::vector<struct ggml_tensor *> dac_stages;
++    struct ggml_tensor *              audio = dac_build_graph(gctx, &pc->dac, h, dump ? &dac_stages : nullptr);
++    if (dump) {
++        for (auto * t : dac_stages) {
++            ggml_set_output(t);
++        }
++    }
++    ggml_set_name(audio, "audio_out");
++    ggml_set_output(audio);
++
++    // Build forward graph
++    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
++    ggml_build_forward_expand(graph, audio);
++
++    // Allocate intermediates + input/output buffers in one shot on the backend.
++    if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
++        fprintf(stderr, "[PipelineCodec] FATAL: gallocr_alloc_graph failed\n");
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    // Upload codes to the backend tensor (allocated by gallocr above).
++    ggml_backend_tensor_set(codes_in, codes, 0, (size_t) n_frames * num_codebooks * sizeof(int32_t));
++
++    // Compute
++    enum ggml_status st = ggml_backend_sched_graph_compute(pc->sched, graph);
++    if (st != GGML_STATUS_SUCCESS) {
++        fprintf(stderr, "[PipelineCodec] FATAL: graph_compute status=%d\n", (int) st);
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    // Optional debug dump of intermediate stages.
++    if (dump) {
++        auto dump_tensor = [](const char * path, struct ggml_tensor * t) {
++            const size_t       n = ggml_nelements(t);
++            std::vector<float> tmp(n);
++            ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(float));
++            FILE * f = fopen(path, "wb");
++            fwrite(tmp.data(), sizeof(float), n, f);
++            fclose(f);
++            fprintf(stderr, "[PipelineCodec] Dumped %s: %zu f32 values, ne=(%lld, %lld, %lld, %lld)\n", path, n,
++                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
++        };
++        dump_tensor("cpp_rvq_out.raw", latent);
++        dump_tensor("cpp_fc2_out.raw", fc2_out);
++        for (auto * t : dac_stages) {
++            char path[64];
++            snprintf(path, sizeof(path), "cpp_%s.raw", ggml_get_name(t));
++            dump_tensor(path, t);
++        }
++    }
++
++    // Copy output back to host. audio->ne = (T_out, 1), total = T_out floats.
++    const int          T_out = (int) audio->ne[0];
++    std::vector<float> out((size_t) T_out);
++    ggml_backend_tensor_get(audio, out.data(), 0, (size_t) T_out * sizeof(float));
++
++    ggml_backend_sched_reset(pc->sched);
++    ggml_free(gctx);
++    return out;
++}
++
++// Compute T_a = output time length of the DAC encoder for a given audio
++// sample count. Matches the upstream HiggsAudioV2 acoustic_encoder topology :
++//   conv1 k=7 s=1 p=3                    -> T unchanged
++//   blk0 k=16 s=8 p=4 (in=64  out=128)   -> T_out = (T + 8 - 16) / 8 + 1
++//   blk1 k=10 s=5 p=3 (in=128 out=256)   -> T_out = (T + 6 - 10) / 5 + 1
++//   blk2 k=8  s=4 p=2 (in=256 out=512)   -> T_out = (T + 4 - 8)  / 4 + 1
++//   blk3 k=4  s=2 p=1 (in=512 out=1024)  -> T_out = (T + 2 - 4)  / 2 + 1
++//   blk4 k=6  s=3 p=2 (in=1024 out=2048) -> T_out = (T + 4 - 6)  / 3 + 1
++//   conv2 k=3 s=1 p=1                    -> T unchanged
++// Used to detect the T_a != T_s case before deciding whether to pad audio.
++static int compute_dac_output_length(int n_samples) {
++    static const int K[5] = { 16, 10, 8, 4, 6 };
++    static const int S[5] = { 8, 5, 4, 2, 3 };
++    static const int P[5] = { 4, 3, 2, 1, 2 };
++    int              T    = n_samples;
++    for (int i = 0; i < 5; i++) {
++        T = (T + 2 * P[i] - K[i]) / S[i] + 1;
++    }
++    return T;
++}
++
++// Forward declarations for the encode pipeline helpers : isolated graphs
++// chained together by pipeline_codec_encode.
++static std::vector<float> pipeline_codec_hubert_features_test(PipelineCodec * pc,
++                                                              const float *   audio_f32,
++                                                              int             n_samples,
++                                                              const char *    dump_dir);
++static std::vector<float> pipeline_codec_sem_enc_test(PipelineCodec * pc, const float * features_f32, int n_frames);
++static std::vector<float> pipeline_codec_dac_enc_test(PipelineCodec * pc, const float * audio_f32, int n_samples);
++
++std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
++                                           const float *   audio_24k,
++                                           int             n_samples,
++                                           const char *    dump_dir) {
++    if (n_samples <= 0) {
++        return {};
++    }
++
++    // Step 1 : resample 24 kHz -> 16 kHz mono and pad with 160 zeros on each
++    // side, matching HiggsAudioV2 _extract_semantic_features.
++    int     n_16k     = 0;
++    float * resampled = audio_resample(audio_24k, n_samples, pc->sample_rate, 16000, 1, &n_16k);
++    if (!resampled || n_16k <= 0) {
++        free(resampled);
++        return {};
++    }
++    if (dump_dir) {
++        DebugDumper dbg;
++        debug_init(&dbg, dump_dir);
++        debug_dump_1d(&dbg, "ref-audio-16k", resampled, n_16k);
++    }
++    const int          n_padded = n_16k + 320;
++    std::vector<float> audio_16k_padded((size_t) n_padded, 0.0f);
++    std::memcpy(audio_16k_padded.data() + 160, resampled, (size_t) n_16k * sizeof(float));
++    free(resampled);
++
++    // Step 2 : full HuBERT features pipeline -> e_semantic_input (768, T_s).
++    std::vector<float> features = pipeline_codec_hubert_features_test(pc, audio_16k_padded.data(), n_padded, dump_dir);
++    if (features.empty()) {
++        return {};
++    }
++    const int T_s = (int) (features.size() / 768);
++
++    if (dump_dir) {
++        DebugDumper dbg;
++        debug_init(&dbg, dump_dir);
++        debug_dump_2d(&dbg, "ref-hubert-features", features.data(), T_s, 768);
++    }
++
++    // hubert_features returns ne=(768, T_s) with K fast (768 axis). sem_enc
++    // graph input expects ne=(T_s, 768) with T fast (dac_conv1d layout, mirror
++    // of the reference encoder_semantic which receives sem_in.transpose(1,2)
++    // before the conv stack). Transpose the flat buffer : K-fast to T-fast.
++    std::vector<float> features_t(features.size());
++    for (int t = 0; t < T_s; t++) {
++        for (int k = 0; k < SEM_HIDDEN; k++) {
++            features_t[t + (size_t) k * T_s] = features[k + (size_t) t * SEM_HIDDEN];
++        }
++    }
++
++    // Step 3 : SemanticEncoder refines the features in-place (no temporal
++    // downsample), output stays T-first (T_s, 768).
++    std::vector<float> e_semantic = pipeline_codec_sem_enc_test(pc, features_t.data(), T_s);
++    if (e_semantic.empty()) {
++        return {};
++    }
++
++    // Step 4 : DAC encoder. Decide pad branch from analytical T_a vs measured
++    // T_s. Upstream uses self.pad = hop_length // 2 = 480 zeros on each side.
++    const int          T_a_no_pad = compute_dac_output_length(n_samples);
++    std::vector<float> e_acoustic;
++    if (T_a_no_pad != T_s) {
++        const int          p = pc->hop_length / 2;
++        std::vector<float> padded((size_t) (n_samples + 2 * p), 0.0f);
++        std::memcpy(padded.data() + p, audio_24k, (size_t) n_samples * sizeof(float));
++        e_acoustic = pipeline_codec_dac_enc_test(pc, padded.data(), (int) padded.size());
++    } else {
++        e_acoustic = pipeline_codec_dac_enc_test(pc, audio_24k, n_samples);
++    }
++    if (e_acoustic.empty()) {
++        return {};
++    }
++    const int T_a = (int) (e_acoustic.size() / 256);
++    if (T_a != T_s) {
++        fprintf(stderr, "[Encode] FATAL: post-DAC T_a=%d does not match HuBERT T_s=%d\n", T_a, T_s);
++        return {};
++    }
++
++    // Step 5 : fused graph for concat + fc + RVQ encode. ac and sem land on
++    // the backend as inputs, the rest stays on the GPU until the codes copy.
++    const int    T              = T_s;
++    const int    n_max_nodes    = 4096;
++    const size_t graph_ctx_size = ggml_tensor_overhead() * n_max_nodes + ggml_graph_overhead_custom(n_max_nodes, false);
++
++    struct ggml_init_params gp   = { graph_ctx_size, NULL, /*no_alloc=*/true };
++    struct ggml_context *   gctx = ggml_init(gp);
++    if (!gctx) {
++        return {};
++    }
++
++    // dac_enc and sem_enc both return tensors in T-first layout (ne=(T, C)
++    // with T on the fast axis). We mirror that on the input side and transpose
++    // to C-first inside the graph, so the cat-on-channel axis + fc Linear stay
++    // simple mul_mat operations downstream.
++    struct ggml_tensor * ac_t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, T, 256);
++    ggml_set_name(ac_t, "acoustic");
++    ggml_set_input(ac_t);
++
++    struct ggml_tensor * sem_t = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, T, 768);
++    ggml_set_name(sem_t, "semantic");
++    ggml_set_input(sem_t);
++
++    // (T, C) -> (C, T) so the channel axis lives on ne[0] (fast).
++    struct ggml_tensor * ac_c  = ggml_cont(gctx, ggml_transpose(gctx, ac_t));
++    struct ggml_tensor * sem_c = ggml_cont(gctx, ggml_transpose(gctx, sem_t));
++
++    // Concat [acoustic, semantic] on the channel axis ne[0] : (256+768=1024, T).
++    // Upstream order in encode() is torch.cat([e_acoustic, e_semantic], dim=1).
++    struct ggml_tensor * pre_fc = ggml_concat(gctx, ac_c, sem_c, 0);
++    ggml_set_name(pre_fc, "encode_pre_fc");
++
++    // fc Linear (1024 -> 1024). C-first layout makes mul_mat direct, no transpose.
++    struct ggml_tensor * embed = ggml_mul_mat(gctx, pc->fc_w, pre_fc);
++    struct ggml_tensor * fcb2d = ggml_reshape_2d(gctx, pc->fc_b, 1024, 1);
++    embed                      = ggml_add(gctx, embed, fcb2d);
++    ggml_set_name(embed, "encode_embed");
++
++    // Optional debug : keep pre_fc and embed alive across the graph so we can
++    // copy them back post compute, to compare the RVQ input bit-for-bit and
++    // isolate where the divergence is born (concat vs fc Linear).
++    const bool dump = std::getenv("OMNIVOICE_DUMP_STAGES") != NULL;
++    if (dump) {
++        ggml_set_output(pre_fc);
++        ggml_set_output(embed);
++    }
++
++    // RVQ encode loop : 8 codebooks, each producing a (T,) i32 tensor with the
++    // selected indices. The graph itself emits 8 separate output tensors.
++    struct ggml_tensor * idx_per_k[RVQ_NUM_CODEBOOKS] = { 0 };
++    rvq_encode_graph(gctx, &pc->rvq, embed, idx_per_k);
++    for (int k = 0; k < RVQ_NUM_CODEBOOKS; k++) {
++        ggml_set_output(idx_per_k[k]);
++    }
++
++    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
++    for (int k = 0; k < RVQ_NUM_CODEBOOKS; k++) {
++        ggml_build_forward_expand(graph, idx_per_k[k]);
++    }
++
++    if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    ggml_backend_tensor_set(ac_t, e_acoustic.data(), 0, e_acoustic.size() * sizeof(float));
++    ggml_backend_tensor_set(sem_t, e_semantic.data(), 0, e_semantic.size() * sizeof(float));
++
++    enum ggml_status st = ggml_backend_sched_graph_compute(pc->sched, graph);
++    if (st != GGML_STATUS_SUCCESS) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    // Optional debug dump of the fc input (post concat) and output (RVQ input).
++    if (dump) {
++        auto dump_tensor = [](const char * path, struct ggml_tensor * t) {
++            const size_t       n = ggml_nelements(t);
++            std::vector<float> tmp(n);
++            ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(float));
++            FILE * f = fopen(path, "wb");
++            fwrite(tmp.data(), sizeof(float), n, f);
++            fclose(f);
++            fprintf(stderr, "[Encode] Dumped %s: %zu f32 values, ne=(%lld, %lld)\n", path, n, (long long) t->ne[0],
++                    (long long) t->ne[1]);
++        };
++        dump_tensor("cpp_encode_pre_fc.raw", pre_fc);
++        dump_tensor("cpp_encode_embed.raw", embed);
++    }
++
++    // Pack codes row-major : (CB, T) with codebook leading.
++    std::vector<int32_t> codes((size_t) RVQ_NUM_CODEBOOKS * (size_t) T);
++    for (int k = 0; k < RVQ_NUM_CODEBOOKS; k++) {
++        ggml_backend_tensor_get(idx_per_k[k], &codes[(size_t) k * (size_t) T], 0, (size_t) T * sizeof(int32_t));
++    }
++
++    ggml_backend_sched_reset(pc->sched);
++    ggml_free(gctx);
++    return codes;
++}
++
++void pipeline_codec_free(PipelineCodec * pc) {
++    if (pc->sched) {
++        ggml_backend_sched_free(pc->sched);
++    }
++    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
++        hubert_layer_free(&pc->hubert_layers[i]);
++    }
++    hubert_enc_init_free(&pc->hubert_enc_init);
++    hubert_proj_free(&pc->hubert_proj);
++    hubert_feat_free(&pc->hubert_feat);
++    sem_enc_free(&pc->sem_enc);
++    dac_enc_free(&pc->dac_enc);
++    dac_free(&pc->dac);
++    wctx_free(&pc->wctx);
++    *pc = {};
++}
++
++// Debug : run only the DAC encoder on a precomputed audio waveform. Used to
++// validate dac-encoder.h in isolation against reference acoustic_encoder before
++// the full encode pipeline (HuBERT, SemanticEncoder, fc, RVQ) is wired up.
++//
++// `audio_f32` is [T_in] mono 24 kHz. Returns the latent flat in GGML layout
++// (T_out fast, 256 channels slow) so the caller can write it directly to a
++// raw f32 file and compare against the reference.
++static std::vector<float> pipeline_codec_dac_enc_test(PipelineCodec * pc, const float * audio_f32, int n_samples) {
++    if (n_samples <= 0) {
++        return {};
++    }
++
++    const int    n_max_nodes    = 4096;
++    const size_t graph_ctx_size = ggml_tensor_overhead() * n_max_nodes + ggml_graph_overhead_custom(n_max_nodes, false);
++
++    struct ggml_init_params gp   = { graph_ctx_size, NULL, /*no_alloc=*/true };
++    struct ggml_context *   gctx = ggml_init(gp);
++    if (!gctx) {
++        return {};
++    }
++
++    // Audio input [T_in, 1] f32 to match the dac_conv1d input layout
++    // (ne[0]=T fast, ne[1]=channels slow).
++    struct ggml_tensor * audio_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_samples, 1);
++    ggml_set_name(audio_in, "audio_in");
++    ggml_set_input(audio_in);
++
++    struct ggml_tensor * latent = dac_enc_build_graph(gctx, &pc->dac_enc, audio_in);
++    ggml_set_output(latent);
++
++    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
++    ggml_build_forward_expand(graph, latent);
++
++    if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    ggml_backend_tensor_set(audio_in, audio_f32, 0, (size_t) n_samples * sizeof(float));
++
++    enum ggml_status st = ggml_backend_sched_graph_compute(pc->sched, graph);
++    if (st != GGML_STATUS_SUCCESS) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    const size_t       n = ggml_nelements(latent);
++    std::vector<float> latent_out(n);
++    ggml_backend_tensor_get(latent, latent_out.data(), 0, n * sizeof(float));
++
++    ggml_backend_sched_reset(pc->sched);
++    ggml_free(gctx);
++    return latent_out;
++}
++
++// Debug : run only the SemanticEncoder on a precomputed [T, 768] f32 input
++// (typically the post-HuBERT downsampled features dumped from the reference). The
++// output has the same shape, returned flat in GGML layout (T fast, 768 slow).
++static std::vector<float> pipeline_codec_sem_enc_test(PipelineCodec * pc, const float * features_f32, int n_frames) {
++    if (n_frames <= 0) {
++        return {};
++    }
++
++    const int    n_max_nodes    = 4096;
++    const size_t graph_ctx_size = ggml_tensor_overhead() * n_max_nodes + ggml_graph_overhead_custom(n_max_nodes, false);
++
++    struct ggml_init_params gp   = { graph_ctx_size, NULL, /*no_alloc=*/true };
++    struct ggml_context *   gctx = ggml_init(gp);
++    if (!gctx) {
++        return {};
++    }
++
++    // Input [T, 768] f32, GGML layout T fast (matches dac_conv1d input).
++    struct ggml_tensor * sem_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_frames, SEM_HIDDEN);
++    ggml_set_name(sem_in, "sem_in");
++    ggml_set_input(sem_in);
++
++    struct ggml_tensor * sem_out = sem_enc_build_graph(gctx, &pc->sem_enc, sem_in);
++    ggml_set_output(sem_out);
++
++    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
++    ggml_build_forward_expand(graph, sem_out);
++
++    if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    ggml_backend_tensor_set(sem_in, features_f32, 0, (size_t) n_frames * SEM_HIDDEN * sizeof(float));
++
++    enum ggml_status st = ggml_backend_sched_graph_compute(pc->sched, graph);
++    if (st != GGML_STATUS_SUCCESS) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    const size_t       n = ggml_nelements(sem_out);
++    std::vector<float> out(n);
++    ggml_backend_tensor_get(sem_out, out.data(), 0, n * sizeof(float));
++
++    ggml_backend_sched_reset(pc->sched);
++    ggml_free(gctx);
++    return out;
++}
++
++// Debug : full _extract_semantic_features pipeline.
++//   audio (16 kHz pre-padded) -> feat_extractor -> feat_projection
++//   -> enc_init -> 12 transformer layers (capture 13 hidden states)
++//   -> mean over the 13 states -> downsample time axis by 2
++// All of this lives inside one graph for a single backend roundtrip.
++static std::vector<float> pipeline_codec_hubert_features_test(PipelineCodec * pc,
++                                                              const float *   audio_f32,
++                                                              int             n_samples,
++                                                              const char *    dump_dir) {
++    if (n_samples <= 0) {
++        return {};
++    }
++
++    // 12 layers + projection + pos_conv decomposition -> ~1500 nodes total.
++    // Bumping to 16384 leaves headroom for the mean reduction on top.
++    const int    n_max_nodes    = 16384;
++    const size_t graph_ctx_size = ggml_tensor_overhead() * n_max_nodes + ggml_graph_overhead_custom(n_max_nodes, false);
++
++    struct ggml_init_params gp   = { graph_ctx_size, NULL, /*no_alloc=*/true };
++    struct ggml_context *   gctx = ggml_init(gp);
++    if (!gctx) {
++        return {};
++    }
++
++    struct ggml_tensor * audio = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_samples, 1);
++    ggml_set_name(audio, "audio");
++    ggml_set_input(audio);
++
++    // Feature extraction stack : audio -> conv -> projection -> enc_init.
++    // The extra out_post_ln tap on the projection lets us tell the LayerNorm
++    // and the 512 -> 768 Linear apart inside hubert-feat-proj.
++    struct ggml_tensor * feat         = hubert_feat_build_graph(gctx, &pc->hubert_feat, audio);
++    struct ggml_tensor * proj_post_ln = NULL;
++    struct ggml_tensor * proj         = hubert_proj_build_graph(gctx, &pc->hubert_proj, feat, &proj_post_ln);
++    struct ggml_tensor * h            = hubert_enc_init_build_graph(gctx, &pc->hubert_enc_init, proj);
++
++    // Capture the 13 hidden states fed to the stack mean : (post enc_init,
++    // post layer 0, ..., post layer 11). The reference encoder loop snapshots the input
++    // before each layer call, then appends the final output once after the
++    // loop, which is mathematically the same sequence.
++    const int            n_states = HUBERT_NUM_LAYERS + 1;
++    struct ggml_tensor * states[n_states];
++    states[0] = h;
++    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
++        h             = hubert_layer_build_graph(gctx, &pc->hubert_layers[i], h);
++        states[i + 1] = h;
++    }
++
++    // Mean-pool the 13 states : sum then scale by 1/13. ggml_add chains nicely
++    // and stays within the F32/F16 src1 contract on CUDA.
++    struct ggml_tensor * sum = states[0];
++    for (int i = 1; i < n_states; i++) {
++        sum = ggml_add(gctx, sum, states[i]);
++    }
++    struct ggml_tensor * mean = ggml_scale(gctx, sum, 1.0f / (float) n_states);
++
++    // Downsample by semantic_downsample_factor = 2 along the time axis.
++    // mean has ne=(768, T_h). We pick every other column starting at 0 via a
++    // strided view, then make it contiguous so the host copy stays simple.
++    const int            T_h      = (int) mean->ne[1];
++    const int            T_out    = T_h / 2;
++    struct ggml_tensor * strided  = ggml_view_2d(gctx, mean, HUBERT_HIDDEN, T_out, 2 * mean->nb[1], 0);
++    struct ggml_tensor * features = ggml_cont(gctx, strided);
++    ggml_set_output(features);
++
++    // Bisect taps : keep the buffers of the intermediate stages alive past the
++    // memory planner so they can be copied back after compute. Cheap, only 8
++    // [768, T_h] f32 tensors plus feat at [512, T_feat] and proj-ln at
++    // [512, T_feat], total ~13 MB.
++    if (dump_dir) {
++        ggml_set_output(feat);
++        ggml_set_output(proj_post_ln);
++        ggml_set_output(proj);
++        ggml_set_output(states[0]);
++        ggml_set_output(states[1]);
++        ggml_set_output(states[6]);
++        ggml_set_output(states[8]);
++        ggml_set_output(states[10]);
++        ggml_set_output(states[12]);
++    }
++
++    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
++    ggml_build_forward_expand(graph, features);
++
++    if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    ggml_backend_tensor_set(audio, audio_f32, 0, (size_t) n_samples * sizeof(float));
++
++    enum ggml_status st = ggml_backend_sched_graph_compute(pc->sched, graph);
++    if (st != GGML_STATUS_SUCCESS) {
++        ggml_backend_sched_reset(pc->sched);
++        ggml_free(gctx);
++        return {};
++    }
++
++    // Bisect dumps. ne layout is (C, T) on every tap, so we dump as (T, C) which
++    // matches the natural numpy reshape on the linear buffer. Names mirror the
++    // Python hooks installed in the test script.
++    if (dump_dir) {
++        DebugDumper dbg;
++        debug_init(&dbg, dump_dir);
++        auto dump_tap = [&](struct ggml_tensor * t, const char * name) {
++            const int          T   = (int) t->ne[1];
++            const int          C   = (int) t->ne[0];
++            const size_t       nel = (size_t) T * (size_t) C;
++            std::vector<float> buf(nel);
++            ggml_backend_tensor_get(t, buf.data(), 0, nel * sizeof(float));
++            debug_dump_2d(&dbg, name, buf.data(), T, C);
++        };
++        dump_tap(feat, "hubert-feat-extract");
++        dump_tap(proj_post_ln, "hubert-feat-proj-ln");
++        dump_tap(proj, "hubert-feat-proj");
++        dump_tap(states[0], "hubert-enc-init");
++        dump_tap(states[1], "hubert-l0");
++        dump_tap(states[6], "hubert-l5");
++        dump_tap(states[8], "hubert-l7");
++        dump_tap(states[10], "hubert-l9");
++        dump_tap(states[12], "hubert-l11");
++    }
++
++    const size_t       n = ggml_nelements(features);
++    std::vector<float> out(n);
++    ggml_backend_tensor_get(features, out.data(), 0, n * sizeof(float));
++
++    ggml_backend_sched_reset(pc->sched);
++    ggml_free(gctx);
++    return out;
++}
+diff --git a/src/pipeline-codec.h b/src/pipeline-codec.h
+index 82ce731..8ad26bf 100644
+--- a/src/pipeline-codec.h
++++ b/src/pipeline-codec.h
+@@ -50,6 +50,11 @@ struct PipelineCodec {
+     // permutation) that don't fit the gf_load_tensor passthrough scheme.
+     WeightCtx wctx;
+ 
++    // Encode-path fc weights live in their own WeightCtx when CPU offload is
++    // active (enc_backend != NULL). This allows loading fc_w/fc_b on a
++    // different backend than the decode-path RVQ/fc2 weights.
++    WeightCtx enc_wctx;
++
+     // Backend pair (GPU + CPU fallback) and scheduler. The scheduler routes
+     // ops the GPU backend cannot run (e.g. K-quant get_rows on CUDA) to the
+     // CPU backend. Compute uses ggml_backend_sched_graph_compute.
+@@ -64,7 +69,15 @@ struct PipelineCodec {
+ 
+ // Open the GGUF, load all weights to the backend, close the GGUF mapping.
+ // Returns true on success. On failure the struct is left in a clean state.
+-bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp);
++// Open the GGUF, load all weights to the backend, close the GGUF mapping.
++// When enc_backend is non-NULL, encode-path components (HuBERT, DAC encoder,
++// SemanticEncoder, fc weights) are loaded on enc_backend instead of bp.backend.
++// This offloads ~230 MB of encode-only weights to CPU, freeing GPU VRAM for
++// the decode path. Pass NULL to keep everything on bp.backend (default).
++// When skip_encode is true, encode-path components are not loaded at all.
++// This saves ~417 MB VRAM when only instruct mode is needed (no cloning).
++bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp,
++                         ggml_backend_t enc_backend = NULL, bool skip_encode = false);
+ 
+ // Decode RVQ codes into a mono 24 kHz waveform.
+ //   codes : row-major i32, num_codebooks rows of n_frames each (T fast).
+new file mode 100644
+index 0000000..82ce731
+--- /dev/null
++++ b/src/pipeline-codec.h.orig
+@@ -0,0 +1,92 @@
++#pragma once
++// pipeline-codec.h : audio-tokenizer decode pipeline for OmniVoice.
++// Loads the audio-tokenizer GGUF, holds RVQ + fc2 + DAC weights on the
++// backend, and exposes a one-shot decode call :
++//
++//   codes [num_codebooks, T] i32  ->  audio [T * 960] f32 mono 24 kHz
++
++#include "backend.h"
++#include "dac-decoder.h"
++#include "dac-encoder.h"
++#include "ggml-backend.h"
++#include "gguf-weights.h"
++#include "hubert-enc.h"
++#include "rvq-codec.h"
++#include "semantic-enc.h"
++#include "weight-ctx.h"
++
++#include <cstdint>
++#include <vector>
++
++struct PipelineCodec {
++    // GGUF source. Mmap is closed inside pipeline_codec_load once the data
++    // has been copied to the backend.
++    GGUFModel gguf;
++
++    // Audio tokenizer modules
++    RVQCodec             rvq;
++    DACDecoder           dac;
++    DACEncoder           dac_enc;
++    SemanticEncoder      sem_enc;
++    HubertFeatExtractor  hubert_feat;
++    HubertFeatProjection hubert_proj;
++    HubertEncInit        hubert_enc_init;
++    HubertLayer          hubert_layers[HUBERT_NUM_LAYERS];
++
++    // fc Linear post-concat acoustic+semantic in encode path. Loaded into the
++    // shared wctx alongside RVQ and fc2.
++    //   fc_w : bf16 ne=(1024, 1024)
++    //   fc_b : f32  ne=(1024)
++    struct ggml_tensor * fc_w;
++    struct ggml_tensor * fc_b;
++
++    // fc2 Linear : RVQ output 1024 -> DAC input 256
++    // Bias loaded as F32 (ggml_add CUDA needs F32/F16 on src1, same as DAC)
++    struct ggml_tensor * fc2_w;  // bf16 ne=(1024, 256)
++    struct ggml_tensor * fc2_b;  // f32  ne=(256)
++
++    // RVQ + fc2 share one WeightCtx. DACDecoder owns its own buffer because
++    // it applies per-tensor transforms at load (snake reciprocal, conv_t
++    // permutation) that don't fit the gf_load_tensor passthrough scheme.
++    WeightCtx wctx;
++
++    // Backend pair (GPU + CPU fallback) and scheduler. The scheduler routes
++    // ops the GPU backend cannot run (e.g. K-quant get_rows on CUDA) to the
++    // CPU backend. Compute uses ggml_backend_sched_graph_compute.
++    BackendPair          bp;
++    ggml_backend_t       backend;
++    ggml_backend_sched_t sched;
++
++    // Audio metadata read from GGUF KV
++    int sample_rate;  // 24000
++    int hop_length;   // 960 (cumulative DAC upsample stride)
++};
++
++// Open the GGUF, load all weights to the backend, close the GGUF mapping.
++// Returns true on success. On failure the struct is left in a clean state.
++bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp);
++
++// Decode RVQ codes into a mono 24 kHz waveform.
++//   codes : row-major i32, num_codebooks rows of n_frames each (T fast).
++// Returns audio of length n_frames * pc->hop_length, empty on failure.
++std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int num_codebooks, int n_frames);
++
++// Encode a 24 kHz mono waveform into RVQ codes. Chains the full audio
++// tokenizer pipeline :
++//   resample 24k->16k + pad 160 (CPU)
++//   HuBERT features                   -> e_semantic_input (768, T_s)
++//   SemanticEncoder                   -> e_semantic       (768, T_s)
++//   DAC encoder (with conditional pad) -> e_acoustic       (256, T_a)
++//   concat [acoustic, semantic]        -> embeddings       (1024, T)
++//   fc Linear (1024 -> 1024)           -> projected        (1024, T)
++//   RVQ encode loop                    -> codes            (CB=8, T) i32
++// Returns codes flat in (CB, T) row-major, empty on failure.
++// dump_dir : when non null, writes ref-audio-16k and ref-hubert-features
++// debug binaries into that directory. Pass NULL to skip.
++std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
++                                           const float *   audio_24k,
++                                           int             n_samples,
++                                           const char *    dump_dir = NULL);
++
++// Free all backend buffers and GGML contexts. Safe to call on a zeroed struct.
++void pipeline_codec_free(PipelineCodec * pc);
+diff --git a/tools/omnivoice-tts.cpp b/tools/omnivoice-tts.cpp
+index cb65401..84a2456 100644
+--- a/tools/omnivoice-tts.cpp
++++ b/tools/omnivoice-tts.cpp
+@@ -7,6 +7,7 @@
+ // tensors and bypass the codec decode.
+ 
+ #include "audio-io.h"
++#include "audio-postproc.h"
+ #include "backend.h"
+ #include "bpe.h"
+ #include "duration-estimator.h"
+@@ -14,6 +15,7 @@
+ #include "omnivoice.h"
+ #include "pipeline-codec.h"
+ #include "pipeline-tts.h"
++#include "text-chunker.h"
+ #include "version.h"
+ #include "voice-design.h"
+ 
+@@ -25,8 +27,32 @@
+ #include <random>
+ #include <sstream>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
++struct CachedRef {
++    std::vector<int32_t> codes;
++    int                  T;
++    float                rms;
++};
++
++static std::string hash_file_head(const std::string & path, size_t nbytes = 4096) {
++    FILE * f = fopen(path.c_str(), "rb");
++    if (!f) return "";
++    std::string buf(nbytes, '\0');
++    size_t n = fread(&buf[0], 1, nbytes, f);
++    fclose(f);
++    buf.resize(n);
++    uint64_t h = 14695981039346656037ULL;
++    for (size_t i = 0; i < buf.size(); i++) {
++        h ^= (uint8_t) buf[i];
++        h *= 1099511628211ULL;
++    }
++    char hex[17];
++    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) h);
++    return std::string(hex);
++}
++
+ static void print_usage(const char * prog) {
+     fprintf(stderr, "omnivoice.cpp %s\n\n", OMNIVOICE_VERSION);
+     fprintf(stderr,
+@@ -46,6 +72,10 @@ static void print_usage(const char * prog) {
+             "  --ref-wav <path>        Reference WAV for voice cloning\n"
+             "  --ref-text <path>       Transcript file for the reference (required with --ref-wav)\n"
+             "  --seed <int>            Sampling seed (default: -1 for random)\n"
++            "  --steps <int>           MaskGIT inference steps (default: 32)\n"
++            "  --server                Persistent server mode (read JSON requests from stdin)\n"
++            "  --offload-encode        Offload encode-path (HuBERT, DAC enc, Sem-enc) to CPU\n"
++            "  --decode-only           Skip encode-path loading (saves ~417 MB VRAM, disables cloning)\n"
+             "  --no-preprocess-prompt  Skip ref-wav silence trim and ref-text terminal punctuation\n"
+             "  --chunk-duration <sec>  Long-form chunk duration (default: 15.0, <= 0 disables chunking)\n"
+             "  --chunk-threshold <sec> Activate chunking above this estimated duration (default: 30.0)\n\n"
+@@ -189,6 +219,9 @@ static int run_tts_via_ov(const char * model_path,
+                           const char * codec_path,
+                           bool         use_fa,
+                           bool         clamp_fp16,
++                          bool         offload_encode,
++                          bool         skip_encode,
++                          int          num_steps,
+                           const char * ref_wav_path,
+                           const char * ref_text_path,
+                           const char * prompt_lang,
+@@ -204,10 +237,12 @@ static int run_tts_via_ov(const char * model_path,
+                           WavFormat    wav_fmt) {
+     ov_init_params iparams;
+     ov_init_default_params(&iparams);
+-    iparams.model_path = model_path;
+-    iparams.codec_path = codec_path;
+-    iparams.use_fa     = use_fa;
+-    iparams.clamp_fp16 = clamp_fp16;
++    iparams.model_path     = model_path;
++    iparams.codec_path     = codec_path;
++    iparams.use_fa         = use_fa;
++    iparams.clamp_fp16     = clamp_fp16;
++    iparams.offload_encode = offload_encode;
++    iparams.skip_encode    = skip_encode;
+ 
+     ov_context * ov = ov_init(&iparams);
+     if (!ov) {
+@@ -256,6 +291,7 @@ static int run_tts_via_ov(const char * model_path,
+     // sets the lot ; the CLI seed lands on mg_seed below.
+     ov_tts_params params;
+     ov_tts_default_params(&params);
++    if (num_steps > 0) params.mg_num_step = num_steps;
+     params.text                = text.c_str();
+     params.lang                = lang.c_str();
+     params.instruct            = prompt_instruct ? prompt_instruct : "";
+@@ -284,6 +320,231 @@ static int run_tts_via_ov(const char * model_path,
+     return rc;
+ }
+ 
++static std::string json_get_string(const std::string & json, const std::string & key) {
++    std::string needle = "\"" + key + "\"";
++    size_t pos = json.find(needle);
++    if (pos == std::string::npos) return "";
++    pos = json.find(':', pos + needle.size());
++    if (pos == std::string::npos) return "";
++    pos = json.find('"', pos + 1);
++    if (pos == std::string::npos) return "";
++    pos++;
++    std::string val;
++    bool esc = false;
++    for (size_t i = pos; i < json.size(); i++) {
++        char c = json[i];
++        if (esc) {
++            if (c == 'n') val += '\n';
++            else if (c == 't') val += '\t';
++            else if (c == '"') val += '"';
++            else if (c == '\\') val += '\\';
++            else val += c;
++            esc = false;
++        } else if (c == '\\') {
++            esc = true;
++        } else if (c == '"') {
++            break;
++        } else {
++            val += c;
++        }
++    }
++    return val;
++}
++
++static int json_get_int(const std::string & json, const std::string & key, int def) {
++    std::string needle = "\"" + key + "\"";
++    size_t pos = json.find(needle);
++    if (pos == std::string::npos) return def;
++    pos = json.find(':', pos + needle.size());
++    if (pos == std::string::npos) return def;
++    pos++;
++    while (pos < json.size() && json[pos] == ' ') pos++;
++    if (pos >= json.size() || (json[pos] != '-' && (json[pos] < '0' || json[pos] > '9'))) return def;
++    return atoi(json.c_str() + pos);
++}
++
++static bool json_get_bool(const std::string & json, const std::string & key, bool def) {
++    std::string needle = "\"" + key + "\"";
++    size_t pos = json.find(needle);
++    if (pos == std::string::npos) return def;
++    pos = json.find(':', pos + needle.size());
++    if (pos == std::string::npos) return def;
++    pos++;
++    while (pos < json.size() && json[pos] == ' ') pos++;
++    return json.compare(pos, 4, "true") == 0;
++}
++
++static int run_server_mode(const char * model_path,
++                           const char * codec_path,
++                           bool         use_fa,
++                           bool         clamp_fp16,
++                           bool         offload_encode,
++                           bool         skip_encode,
++                           int          default_steps,
++                           uint64_t     default_seed) {
++    ov_init_params iparams;
++    ov_init_default_params(&iparams);
++    iparams.model_path     = model_path;
++    iparams.codec_path     = codec_path;
++    iparams.use_fa         = use_fa;
++    iparams.clamp_fp16     = clamp_fp16;
++    iparams.offload_encode = offload_encode;
++    iparams.skip_encode    = skip_encode;
++
++    ov_context * ov = ov_init(&iparams);
++    if (!ov) {
++        fprintf(stderr, "[Server] ERROR: ov_init failed: %s\n", ov_last_error());
++        return 1;
++    }
++
++    fprintf(stderr, "[Server] Ready. Send JSON lines on stdin.\n");
++    fprintf(stderr, "[Server] Fields: text, out, lang, instruct, steps, seed, ref_wav, ref_text, denoise, preprocess, duration, fmt\n");
++
++    std::string line;
++    int         n_req = 0;
++    std::unordered_map<std::string, CachedRef> ref_cache;
++    while (std::getline(std::cin, line)) {
++        if (line.empty()) continue;
++        n_req++;
++        fprintf(stderr, "[Server] Request %d\n", n_req);
++
++        std::string text    = json_get_string(line, "text");
++        std::string outpath = json_get_string(line, "out");
++        if (text.empty() || outpath.empty()) {
++            fprintf(stderr, "[Server] ERROR: missing \"text\" or \"out\"\n");
++            printf("ERROR\n");
++            fflush(stdout);
++            continue;
++        }
++
++        std::string lang         = json_get_string(line, "lang");
++        std::string raw_instruct = json_get_string(line, "instruct");
++        std::string ref_wav      = json_get_string(line, "ref_wav");
++        std::string ref_text_path = json_get_string(line, "ref_text");
++        int         steps        = json_get_int(line, "steps", default_steps);
++        int         seed_req     = json_get_int(line, "seed", -1);
++        bool        denoise      = json_get_bool(line, "denoise", true);
++        bool        preprocess   = json_get_bool(line, "preprocess", true);
++        float       duration_sec = (float) json_get_int(line, "duration", 0);
++        std::string fmt_str      = json_get_string(line, "fmt");
++        WavFormat   wav_fmt      = WAV_S16;
++        if (!fmt_str.empty()) {
++            audio_parse_format(fmt_str.c_str(), wav_fmt);
++        }
++
++        uint64_t seed_resolved = (seed_req < 0)
++            ? (uint64_t) std::random_device{}()
++            : (uint64_t) seed_req;
++
++        ov_tts_params params;
++        ov_tts_default_params(&params);
++        params.text              = text.c_str();
++        params.lang              = lang.c_str();
++        params.instruct          = raw_instruct.c_str();
++        params.denoise           = denoise;
++        params.preprocess_prompt = preprocess;
++        params.mg_seed           = seed_resolved;
++        params.mg_num_step       = steps;
++
++        if (duration_sec > 0.0f) {
++            params.T_override = ov_duration_sec_to_tokens(ov, duration_sec);
++        }
++
++        std::vector<float>    ref_audio_buf;
++        std::string           ref_text_str;
++        std::vector<int32_t>  cached_codes;
++        int                   cached_T = 0;
++
++        if (!ref_wav.empty()) {
++            if (ref_text_path.empty()) {
++                fprintf(stderr, "[Server] ERROR: ref_wav requires ref_text\n");
++                printf("ERROR\n");
++                fflush(stdout);
++                continue;
++            }
++
++            std::string cache_key = hash_file_head(ref_wav);
++            auto it = ref_cache.find(cache_key);
++            if (it != ref_cache.end()) {
++                cached_codes = it->second.codes;
++                cached_T = it->second.T;
++                fprintf(stderr, "[Server] Ref cache hit: %s (K*T=%d)\n", cache_key.c_str(), (int) cached_codes.size());
++                params.ref_audio_tokens = cached_codes.data();
++                params.ref_T = cached_T;
++                params.ref_text = ref_text_path.c_str();
++            } else {
++                int     n_samples = 0;
++                float * raw_samples = audio_read_mono(ref_wav.c_str(), 24000, &n_samples);
++                if (!raw_samples || n_samples <= 0) {
++                    fprintf(stderr, "[Server] ERROR: failed to load %s\n", ref_wav.c_str());
++                    printf("ERROR\n");
++                    fflush(stdout);
++                    continue;
++                }
++                ref_audio_buf.assign(raw_samples, raw_samples + n_samples);
++                free(raw_samples);
++
++                double sumsq = 0.0;
++                for (float v : ref_audio_buf) sumsq += (double) v * (double) v;
++                double ref_rms = std::sqrt(sumsq / (double) ref_audio_buf.size());
++                if (ref_rms > 0.0 && ref_rms < 0.1) {
++                    float gain = (float) (0.1 / ref_rms);
++                    for (float & v : ref_audio_buf) v *= gain;
++                }
++                if (preprocess) {
++                    remove_silence(ref_audio_buf, 24000, 200, 100, 200, -50.0);
++                }
++
++                int32_t * tokens = nullptr;
++                int       ref_T = 0;
++                int       n_encoded = ov_encode_ref(ov, ref_audio_buf.data(), (int) ref_audio_buf.size(), &tokens, &ref_T);
++                if (n_encoded <= 0 || !tokens) {
++                    fprintf(stderr, "[Server] ERROR: ov_encode_ref failed\n");
++                    printf("ERROR\n");
++                    fflush(stdout);
++                    continue;
++                }
++                cached_codes.assign(tokens, tokens + n_encoded);
++                cached_T = ref_T;
++                ov_encoded_ref_free(tokens);
++
++                ref_cache[cache_key] = {cached_codes, cached_T, (float) ref_rms};
++                fprintf(stderr, "[Server] Ref encoded and cached: %s (K=%d T=%d)\n", cache_key.c_str(), 8, cached_T);
++
++                params.ref_audio_tokens = cached_codes.data();
++                params.ref_T = cached_T;
++                params.ref_text = ref_text_path.c_str();
++            }
++        }
++
++        ov_audio audio = {};
++        if (ov_synthesize(ov, &params, &audio) != OV_STATUS_OK) {
++            fprintf(stderr, "[Server] ERROR: synthesis failed: %s\n", ov_last_error());
++            printf("ERROR\n");
++            fflush(stdout);
++            continue;
++        }
++
++        if (!audio_write_wav(outpath.c_str(), audio.samples, audio.n_samples, audio.sample_rate, wav_fmt)) {
++            fprintf(stderr, "[Server] ERROR: WAV write failed\n");
++            ov_audio_free(&audio);
++            printf("ERROR\n");
++            fflush(stdout);
++            continue;
++        }
++        fprintf(stderr, "[Server] OK: %s (%d samples, %.2f s)\n",
++                outpath.c_str(), audio.n_samples,
++                (double) audio.n_samples / (double) audio.sample_rate);
++        ov_audio_free(&audio);
++
++        printf("%s\n", outpath.c_str());
++        fflush(stdout);
++    }
++    fprintf(stderr, "[Server] Shutting down after %d requests\n", n_req);
++    ov_free(ov);
++    return 0;
++}
++
+ int main(int argc, char ** argv) {
+     if (argc <= 1) {
+         print_usage(argv[0]);
+@@ -311,6 +572,10 @@ int main(int argc, char ** argv) {
+     bool         use_fa                 = true;
+     bool         clamp_fp16             = false;
+     int          seed_arg               = -1;
++    int          num_steps              = -1;
++    bool         server_mode            = false;
++    bool         offload_encode         = false;
++    bool         decode_only            = false;
+     const char * dump_dir               = NULL;
+     WavFormat    wav_fmt                = WAV_S16;
+ 
+@@ -347,6 +612,14 @@ int main(int argc, char ** argv) {
+             ref_text_path = argv[++i];
+         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+             seed_arg = atoi(argv[++i]);
++        } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
++            num_steps = atoi(argv[++i]);
++        } else if (strcmp(argv[i], "--server") == 0) {
++            server_mode = true;
++        } else if (strcmp(argv[i], "--offload-encode") == 0) {
++            offload_encode = true;
++        } else if (strcmp(argv[i], "--decode-only") == 0) {
++            decode_only = true;
+         } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
+             dump_dir = argv[++i];
+         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+@@ -380,11 +653,11 @@ int main(int argc, char ** argv) {
+         print_usage(argv[0]);
+         return 1;
+     }
+-    if (!output_path) {
++    if (!server_mode && !output_path) {
+         print_usage(argv[0]);
+         return 1;
+     }
+-    if (tts_mode && !codec_path) {
++    if ((tts_mode || server_mode) && !codec_path) {
+         fprintf(stderr, "[CLI] ERROR: synthesis requires --codec\n");
+         return 1;
+     }
+@@ -403,10 +676,14 @@ int main(int argc, char ** argv) {
+     uint64_t seed_resolved = (seed_arg < 0) ? (uint64_t) std::random_device{}() : (uint64_t) seed_arg;
+     fprintf(stderr, "[CLI] Seed: %llu%s\n", (unsigned long long) seed_resolved, (seed_arg < 0) ? " (random)" : "");
+ 
++    if (server_mode) {
++        return run_server_mode(model_path, codec_path, use_fa, clamp_fp16, offload_encode, decode_only, num_steps, seed_resolved);
++    }
++
+     // TTS mode runs through the OmniVoice handle. Debug modes (--llm-test,
+     // --maskgit-test) keep their lower-level init flow below.
+     if (tts_mode) {
+-        return run_tts_via_ov(model_path, codec_path, use_fa, clamp_fp16, ref_wav_path, ref_text_path, prompt_lang,
++        return run_tts_via_ov(model_path, codec_path, use_fa, clamp_fp16, offload_encode, decode_only, num_steps, ref_wav_path, ref_text_path, prompt_lang,
+                               prompt_instruct, prompt_duration_sec, prompt_denoise, preprocess_prompt,
+                               chunk_duration_sec, chunk_threshold_sec, seed_resolved, dump_dir, output_path, wav_fmt);
+     }
+new file mode 100644
+index 0000000..cb65401
+--- /dev/null
++++ b/tools/omnivoice-tts.cpp.orig
+@@ -0,0 +1,499 @@
++// omnivoice-tts.cpp : TTS CLI for OmniVoice.
++//
++// Default mode synthesises an audio WAV from the target text read on stdin.
++// Voice cloning is enabled by passing --ref-wav <path> and --ref-text <path>
++// (the transcript is read from a file, never from the command line, to keep
++// shell escaping out of the critical path). Debug modes dump intermediate
++// tensors and bypass the codec decode.
++
++#include "audio-io.h"
++#include "backend.h"
++#include "bpe.h"
++#include "duration-estimator.h"
++#include "maskgit-tts.h"
++#include "omnivoice.h"
++#include "pipeline-codec.h"
++#include "pipeline-tts.h"
++#include "version.h"
++#include "voice-design.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <random>
++#include <sstream>
++#include <string>
++#include <vector>
++
++static void print_usage(const char * prog) {
++    fprintf(stderr, "omnivoice.cpp %s\n\n", OMNIVOICE_VERSION);
++    fprintf(stderr,
++            "Usage: %s --model <gguf> --codec <gguf> [options] -o <out.wav> < text.txt\n\n"
++            "Required:\n"
++            "  --model <gguf>          LLM GGUF (F32 / BF16 / Q8_0)\n"
++            "  --codec <gguf>          Codec GGUF (omnivoice-tokenizer-*.gguf)\n"
++            "  -o <path>               Output WAV (24 kHz mono)\n\n"
++            "Input:\n"
++            "  stdin                   Target text to synthesise\n\n"
++            "Optional:\n"
++            "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
++            "  --lang <str>            Language label (default 'None')\n"
++            "  --instruct <str>        Style instruction (default 'None')\n"
++            "  --duration <sec>        Output duration in seconds (default: estimate from text)\n"
++            "  --no-denoise            Omit the <|denoise|> prefix\n"
++            "  --ref-wav <path>        Reference WAV for voice cloning\n"
++            "  --ref-text <path>       Transcript file for the reference (required with --ref-wav)\n"
++            "  --seed <int>            Sampling seed (default: -1 for random)\n"
++            "  --no-preprocess-prompt  Skip ref-wav silence trim and ref-text terminal punctuation\n"
++            "  --chunk-duration <sec>  Long-form chunk duration (default: 15.0, <= 0 disables chunking)\n"
++            "  --chunk-threshold <sec> Activate chunking above this estimated duration (default: 30.0)\n\n"
++            "Debug:\n"
++            "  --no-fa                 Disable flash attention (matches Python eager attention)\n"
++            "  --clamp-fp16            Clamp hidden states to FP16 range\n"
++            "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n"
++            "  --llm-test <input.bin>  Full LLM forward, dump audio_logits\n"
++            "  --maskgit-test          Greedy MaskGIT decoder, dump audio_tokens [K, T]\n"
++            "                          (no codec decode, reads target text from stdin)\n",
++            prog);
++}
++
++// Read all of stdin into a string. Trims trailing newlines so the prompt
++// matches what a user typed without invisible suffix tokens.
++static std::string read_stdin_text() {
++    std::ostringstream ss;
++    ss << std::cin.rdbuf();
++    std::string s = ss.str();
++    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
++        s.pop_back();
++    }
++    return s;
++}
++
++// Read a small text file (transcript) into a string. Trims trailing newlines.
++static bool read_text_file(const char * path, std::string & out) {
++    FILE * f = fopen(path, "rb");
++    if (!f) {
++        fprintf(stderr, "[OmniVoice-TTS] FATAL: cannot open %s\n", path);
++        return false;
++    }
++    fseek(f, 0, SEEK_END);
++    long sz = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    if (sz < 0) {
++        fclose(f);
++        return false;
++    }
++    out.resize((size_t) sz);
++    if (sz > 0 && fread(&out[0], 1, (size_t) sz, f) != (size_t) sz) {
++        fclose(f);
++        return false;
++    }
++    fclose(f);
++    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
++        out.pop_back();
++    }
++    return true;
++}
++
++// Read [i32 K, i32 S, K*S i32 input_ids, S i32 audio_mask] for --llm-test.
++static bool read_embed_input_dump(const char *           path,
++                                  int *                  K_out,
++                                  int *                  S_out,
++                                  std::vector<int32_t> & input_ids,
++                                  std::vector<int32_t> & audio_mask) {
++    FILE * f = fopen(path, "rb");
++    if (!f) {
++        fprintf(stderr, "[Dump] FATAL: cannot open %s\n", path);
++        return false;
++    }
++    int32_t k_le = 0, s_le = 0;
++    if (fread(&k_le, sizeof(int32_t), 1, f) != 1 || fread(&s_le, sizeof(int32_t), 1, f) != 1) {
++        fprintf(stderr, "[Dump] FATAL: truncated header in %s\n", path);
++        fclose(f);
++        return false;
++    }
++    if (k_le <= 0 || s_le <= 0) {
++        fprintf(stderr, "[Dump] FATAL: invalid header K=%d S=%d in %s\n", (int) k_le, (int) s_le, path);
++        fclose(f);
++        return false;
++    }
++    *K_out = (int) k_le;
++    *S_out = (int) s_le;
++    input_ids.resize((size_t) k_le * (size_t) s_le);
++    audio_mask.resize((size_t) s_le);
++    if (fread(input_ids.data(), sizeof(int32_t), input_ids.size(), f) != input_ids.size() ||
++        fread(audio_mask.data(), sizeof(int32_t), audio_mask.size(), f) != audio_mask.size()) {
++        fprintf(stderr, "[Dump] FATAL: truncated payload in %s\n", path);
++        fclose(f);
++        return false;
++    }
++    fclose(f);
++    return true;
++}
++
++// Write [i32 V, i32 K, i32 S, V*K*S f32 audio_logits] (--llm-test out).
++static bool write_logits_dump(const char * path, int V, int K, int n_frames, const float * data) {
++    FILE * f = fopen(path, "wb");
++    if (!f) {
++        fprintf(stderr, "[Dump] FATAL: cannot open %s for write\n", path);
++        return false;
++    }
++    int32_t hdr[3] = { (int32_t) V, (int32_t) K, (int32_t) n_frames };
++    if (fwrite(hdr, sizeof(int32_t), 3, f) != 3) {
++        fprintf(stderr, "[Dump] FATAL: header write failed for %s\n", path);
++        fclose(f);
++        return false;
++    }
++    const size_t n = (size_t) V * (size_t) K * (size_t) n_frames;
++    if (fwrite(data, sizeof(float), n, f) != n) {
++        fprintf(stderr, "[Dump] FATAL: payload write failed for %s\n", path);
++        fclose(f);
++        return false;
++    }
++    fclose(f);
++    return true;
++}
++
++// Write raw audio_tokens [K, T] i32 row-major (--maskgit-test out).
++static bool write_audio_tokens_dump(const char * path, int K, int T, const std::vector<int32_t> & tokens) {
++    if ((size_t) K * (size_t) T != tokens.size()) {
++        fprintf(stderr, "[Dump] FATAL: token vector size %zu does not match K*T=%d*%d\n", tokens.size(), K, T);
++        return false;
++    }
++    FILE * f = fopen(path, "wb");
++    if (!f) {
++        fprintf(stderr, "[Dump] FATAL: cannot open %s for write\n", path);
++        return false;
++    }
++    if (fwrite(tokens.data(), sizeof(int32_t), tokens.size(), f) != tokens.size()) {
++        fprintf(stderr, "[Dump] FATAL: payload write failed for %s\n", path);
++        fclose(f);
++        return false;
++    }
++    fclose(f);
++    return true;
++}
++
++// Load BPE tokenizer with OmniVoice specials. Combines the base BPE load
++// and the special-token load shared by every synthesis mode.
++static bool load_omnivoice_tokenizer(BPETokenizer * tok, const char * gguf_path) {
++    return load_bpe_from_gguf(tok, gguf_path) && bpe_load_omnivoice_specials(tok, gguf_path);
++}
++
++// Full TTS synthesis path via the OmniVoice handle. Lives outside main so the
++// debug paths (--llm-test, --maskgit-test) keep their lower-level init flow
++// completely untouched.
++static int run_tts_via_ov(const char * model_path,
++                          const char * codec_path,
++                          bool         use_fa,
++                          bool         clamp_fp16,
++                          const char * ref_wav_path,
++                          const char * ref_text_path,
++                          const char * prompt_lang,
++                          const char * prompt_instruct,
++                          float        prompt_duration_sec,
++                          bool         prompt_denoise,
++                          bool         preprocess_prompt,
++                          float        chunk_duration_sec,
++                          float        chunk_threshold_sec,
++                          uint64_t     seed_resolved,
++                          const char * dump_dir,
++                          const char * output_path,
++                          WavFormat    wav_fmt) {
++    ov_init_params iparams;
++    ov_init_default_params(&iparams);
++    iparams.model_path = model_path;
++    iparams.codec_path = codec_path;
++    iparams.use_fa     = use_fa;
++    iparams.clamp_fp16 = clamp_fp16;
++
++    ov_context * ov = ov_init(&iparams);
++    if (!ov) {
++        return 1;
++    }
++
++    int rc = 0;
++
++    // Optional reference WAV. The handle takes the raw mono 24 kHz buffer ;
++    // every preprocessing step (RMS, auto-gain, add_punctuation, silence
++    // trim, hop alignment, codec encode) runs inside ov_synthesize.
++    std::vector<float> ref_audio;
++    std::string        ref_text;
++    if (ref_wav_path) {
++        fprintf(stderr, "[CLI] Reference WAV: %s\n", ref_wav_path);
++        if (!read_text_file(ref_text_path, ref_text)) {
++            ov_free(ov);
++            return 1;
++        }
++        int     n_samples = 0;
++        float * raw       = audio_read_mono(ref_wav_path, 24000, &n_samples);
++        if (!raw || n_samples <= 0) {
++            fprintf(stderr, "[OmniVoice-TTS] FATAL: failed to load %s\n", ref_wav_path);
++            ov_free(ov);
++            return 1;
++        }
++        ref_audio.assign(raw, raw + n_samples);
++        free(raw);
++    }
++
++    std::string text = read_stdin_text();
++    std::string lang = prompt_lang ? prompt_lang : "";
++
++    // Resolve target frame count override from --duration. When unset, the
++    // synthesis pipeline estimates internally and may activate long-form
++    // chunking. An explicit value forces the single-shot path with that
++    // exact frame count.
++    int T_override = 0;
++    if (prompt_duration_sec > 0.0f) {
++        T_override = ov_duration_sec_to_tokens(ov, prompt_duration_sec);
++    }
++
++    // Defaults mirror OmniVoiceGenerationConfig (Python) : num_step=32,
++    // guidance_scale=2.0, t_shift=0.1, layer_penalty_factor=5.0,
++    // position_temperature=5.0, class_temperature=0.0. ov_tts_default_params
++    // sets the lot ; the CLI seed lands on mg_seed below.
++    ov_tts_params params;
++    ov_tts_default_params(&params);
++    params.text                = text.c_str();
++    params.lang                = lang.c_str();
++    params.instruct            = prompt_instruct ? prompt_instruct : "";
++    params.T_override          = T_override;
++    params.chunk_duration_sec  = chunk_duration_sec;
++    params.chunk_threshold_sec = chunk_threshold_sec;
++    params.denoise             = prompt_denoise;
++    params.preprocess_prompt   = preprocess_prompt;
++    params.mg_seed             = seed_resolved;
++    params.ref_audio_24k       = ref_audio.empty() ? nullptr : ref_audio.data();
++    params.ref_n_samples       = (int) ref_audio.size();
++    params.ref_text            = ref_text.c_str();
++    params.dump_dir            = dump_dir;
++
++    ov_audio audio = {};
++    if (ov_synthesize(ov, &params, &audio) != OV_STATUS_OK) {
++        rc = 1;
++    } else if (!audio_write_wav(output_path, audio.samples, audio.n_samples, audio.sample_rate, wav_fmt)) {
++        rc = 1;
++    } else {
++        fprintf(stderr, "[OmniVoice-TTS] TTS: wrote %s (%d samples @ %d Hz, %.2f s)\n", output_path, audio.n_samples,
++                audio.sample_rate, (double) audio.n_samples / (double) audio.sample_rate);
++    }
++    ov_audio_free(&audio);
++    ov_free(ov);
++    return rc;
++}
++
++int main(int argc, char ** argv) {
++    if (argc <= 1) {
++        print_usage(argv[0]);
++        return 0;
++    }
++
++    VoiceDesign vd;
++    voice_design_init(&vd);
++
++    const char * model_path             = NULL;
++    const char * codec_path             = NULL;
++    const char * llm_test_in            = NULL;
++    bool         maskgit_test_mode      = false;
++    const char * prompt_lang            = NULL;
++    const char * prompt_instruct        = NULL;
++    int          prompt_duration_tokens = 0;
++    float        prompt_duration_sec    = 0.0f;
++    bool         prompt_denoise         = true;
++    bool         preprocess_prompt      = true;
++    float        chunk_duration_sec     = 15.0f;
++    float        chunk_threshold_sec    = 30.0f;
++    const char * ref_wav_path           = NULL;
++    const char * ref_text_path          = NULL;
++    const char * output_path            = NULL;
++    bool         use_fa                 = true;
++    bool         clamp_fp16             = false;
++    int          seed_arg               = -1;
++    const char * dump_dir               = NULL;
++    WavFormat    wav_fmt                = WAV_S16;
++
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
++            model_path = argv[++i];
++        } else if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
++            codec_path = argv[++i];
++        } else if (strcmp(argv[i], "--no-fa") == 0) {
++            use_fa = false;
++        } else if (strcmp(argv[i], "--clamp-fp16") == 0) {
++            clamp_fp16 = true;
++        } else if (strcmp(argv[i], "--llm-test") == 0 && i + 1 < argc) {
++            llm_test_in = argv[++i];
++        } else if (strcmp(argv[i], "--maskgit-test") == 0) {
++            maskgit_test_mode = true;
++        } else if (strcmp(argv[i], "--lang") == 0 && i + 1 < argc) {
++            prompt_lang = argv[++i];
++        } else if (strcmp(argv[i], "--instruct") == 0 && i + 1 < argc) {
++            prompt_instruct = argv[++i];
++        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
++            prompt_duration_sec = (float) atof(argv[++i]);
++        } else if (strcmp(argv[i], "--no-denoise") == 0) {
++            prompt_denoise = false;
++        } else if (strcmp(argv[i], "--no-preprocess-prompt") == 0) {
++            preprocess_prompt = false;
++        } else if (strcmp(argv[i], "--chunk-duration") == 0 && i + 1 < argc) {
++            chunk_duration_sec = (float) atof(argv[++i]);
++        } else if (strcmp(argv[i], "--chunk-threshold") == 0 && i + 1 < argc) {
++            chunk_threshold_sec = (float) atof(argv[++i]);
++        } else if (strcmp(argv[i], "--ref-wav") == 0 && i + 1 < argc) {
++            ref_wav_path = argv[++i];
++        } else if (strcmp(argv[i], "--ref-text") == 0 && i + 1 < argc) {
++            ref_text_path = argv[++i];
++        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
++            seed_arg = atoi(argv[++i]);
++        } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
++            dump_dir = argv[++i];
++        } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
++            output_path = argv[++i];
++        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
++            if (!audio_parse_format(argv[++i], wav_fmt)) {
++                fprintf(stderr, "[CLI] ERROR: unknown format: %s\n", argv[i]);
++                print_usage(argv[0]);
++                return 1;
++            }
++        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
++            print_usage(argv[0]);
++            return 0;
++        } else {
++            fprintf(stderr, "[CLI] ERROR: unknown arg: %s\n", argv[i]);
++            print_usage(argv[0]);
++            return 1;
++        }
++    }
++
++    // Mode resolution : llm_test_in OR maskgit_test_mode are debug, the
++    // default is full TTS synthesis. Modes are mutually exclusive.
++    int n_debug = (llm_test_in ? 1 : 0) + (maskgit_test_mode ? 1 : 0);
++    if (n_debug > 1) {
++        fprintf(stderr, "[CLI] ERROR: --llm-test and --maskgit-test are mutually exclusive\n");
++        return 1;
++    }
++    const bool tts_mode = (n_debug == 0);
++
++    if (!model_path) {
++        print_usage(argv[0]);
++        return 1;
++    }
++    if (!output_path) {
++        print_usage(argv[0]);
++        return 1;
++    }
++    if (tts_mode && !codec_path) {
++        fprintf(stderr, "[CLI] ERROR: synthesis requires --codec\n");
++        return 1;
++    }
++    if (ref_wav_path && !ref_text_path) {
++        fprintf(stderr, "[CLI] ERROR: --ref-wav requires --ref-text <path>\n");
++        return 1;
++    }
++    if (ref_wav_path && !tts_mode) {
++        fprintf(stderr, "[CLI] ERROR: --ref-wav is only supported in synthesis mode\n");
++        return 1;
++    }
++
++    // Resolve sampling seed : -1 picks a fresh random seed from std::random_device,
++    // any other value is used verbatim for reproducible runs across the maskgit
++    // RNG.
++    uint64_t seed_resolved = (seed_arg < 0) ? (uint64_t) std::random_device{}() : (uint64_t) seed_arg;
++    fprintf(stderr, "[CLI] Seed: %llu%s\n", (unsigned long long) seed_resolved, (seed_arg < 0) ? " (random)" : "");
++
++    // TTS mode runs through the OmniVoice handle. Debug modes (--llm-test,
++    // --maskgit-test) keep their lower-level init flow below.
++    if (tts_mode) {
++        return run_tts_via_ov(model_path, codec_path, use_fa, clamp_fp16, ref_wav_path, ref_text_path, prompt_lang,
++                              prompt_instruct, prompt_duration_sec, prompt_denoise, preprocess_prompt,
++                              chunk_duration_sec, chunk_threshold_sec, seed_resolved, dump_dir, output_path, wav_fmt);
++    }
++
++    BackendPair bp = backend_init("LM");
++    if (!bp.backend) {
++        return 1;
++    }
++
++    PipelineTTS pt = {};
++    if (!pipeline_tts_load(&pt, model_path, bp, use_fa, clamp_fp16)) {
++        backend_release(bp.backend, bp.cpu_backend);
++        return 1;
++    }
++
++    int rc = 0;
++
++    if (llm_test_in) {
++        int                  K = 0, S = 0;
++        std::vector<int32_t> input_ids, audio_mask;
++        if (!read_embed_input_dump(llm_test_in, &K, &S, input_ids, audio_mask)) {
++            rc = 1;
++        } else {
++            fprintf(stderr, "[OmniVoice-TTS] LM forward: K=%d S=%d\n", K, S);
++            std::vector<float> out = pipeline_tts_llm_forward(&pt, input_ids.data(), audio_mask.data(), NULL, K, S);
++            const int          V   = pt.lm.audio_vocab_size;
++            if (out.empty()) {
++                rc = 1;
++            } else if (!write_logits_dump(output_path, V, K, S, out.data())) {
++                rc = 1;
++            } else {
++                fprintf(stderr, "[OmniVoice-TTS] LM forward: wrote %s (V=%d K=%d S=%d f32)\n", output_path, V, K, S);
++            }
++        }
++    } else if (maskgit_test_mode) {
++        BPETokenizer tok = {};
++        if (!load_omnivoice_tokenizer(&tok, model_path)) {
++            rc = 1;
++        } else {
++            // Force fully greedy run for bytewise reproducibility against the
++            // reference dump. Both temperatures at zero collapse the gumbel
++            // paths, so the CLI seed has no effect here but is wired in for
++            // consistency with the synthesis path.
++            MaskgitConfig mg_cfg        = {};
++            mg_cfg.class_temperature    = 0.0f;
++            mg_cfg.position_temperature = 0.0f;
++            mg_cfg.seed                 = seed_resolved;
++
++            std::string text         = read_stdin_text();
++            std::string lang         = prompt_lang ? prompt_lang : "";
++            std::string raw_instruct = prompt_instruct ? prompt_instruct : "";
++            std::string instruct;
++            if (!pipeline_tts_resolve_instruct(&vd, text, raw_instruct, &instruct)) {
++                rc = 1;
++            } else {
++                // Resolve target frame count : explicit --duration in seconds
++                // (OmniVoice runs at a fixed 25 fps : 24000 / 960), otherwise
++                // estimate from text via the byte-perfect RuleDurationEstimator
++                // mirror. The codec is not loaded in this debug mode, so the
++                // 25 fps frame rate is hardcoded here rather than read from
++                // PipelineCodec.
++                if (prompt_duration_sec > 0.0f) {
++                    prompt_duration_tokens = (int) (prompt_duration_sec * 25.0f);
++                    if (prompt_duration_tokens < 1) {
++                        prompt_duration_tokens = 1;
++                    }
++                } else {
++                    prompt_duration_tokens = duration_estimate_tokens(text, "", 0);
++                }
++
++                std::vector<int32_t> tokens =
++                    pipeline_tts_generate(&pt, &tok, text, lang, instruct, prompt_duration_tokens, prompt_denoise,
++                                          mg_cfg, "", NULL, 0, dump_dir);
++                if (tokens.empty()) {
++                    rc = 1;
++                } else if (!write_audio_tokens_dump(output_path, pt.lm.num_audio_codebook, prompt_duration_tokens,
++                                                    tokens)) {
++                    rc = 1;
++                } else {
++                    fprintf(stderr, "[OmniVoice-TTS] MaskGIT test: wrote %s (K=%d T=%d i32)\n", output_path,
++                            pt.lm.num_audio_codebook, prompt_duration_tokens);
++                }
++            }
++        }
++
++        pipeline_tts_free(&pt);
++        backend_release(bp.backend, bp.cpu_backend);
++        return rc;
++    }
++}

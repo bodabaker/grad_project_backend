@@ -1,0 +1,13 @@
+{
+	"node": "n8n-nodes-ai-agent-v2.AiAgentV2",
+	"nodeVersion": "1.0",
+	"codexVersion": "1.0",
+	"categories": ["AI"],
+	"resources": {
+		"primaryDocumentation": []
+	},
+	"alias": ["AI Agent V2", "Agent", "Audio Agent", "Tool Calling"],
+	"subcategories": {
+		"AI": ["Agents"]
+	}
+}

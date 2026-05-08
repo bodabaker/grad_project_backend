@@ -84,18 +84,10 @@ services:
       - "1024"
       - "-c"
       - "7000"
-      - "-b"
-      - "2048"
       - "-ub"
       - "512"
       - "-ngl"
       - "999"
-      - "--flash-attn"
-      - "on"
-      - "--cache-type-k"
-      - "bf16"
-      - "--cache-type-v"
-      - "bf16"
       - "--no-mmap"
       - "-dio"
       - "--backend-sampling"
@@ -161,19 +153,25 @@ services:
   # temperature=1.0, top_p=0.95, top_k=64.
   # --------------------------------------------------
   gemma-service:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda12-b8757
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda12
     container_name: gemma-service
     restart: unless-stopped
+    runtime: nvidia
     ports:
       - "8081:8080"
     volumes:
       - ./llama/models:/models
       - ./llama/grammars:/grammars
-      - ./llama/mmproj/gemma_mmproj-F16 (1).gguf:/mmproj/mmproj.gguf:ro
+      - ./llama/mmproj/mmproj-BF16.gguf:/mmproj/mmproj.gguf:ro
     environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - LLAMA_ARG_HOST=0.0.0.0
       - LLAMA_ARG_PORT=8080
       - LLAMA_ARG_VERBOSE=1
+    depends_on:
+      fish-speech:
+        condition: service_healthy
     command:
       - "--host"
       - "0.0.0.0"
@@ -184,20 +182,24 @@ services:
       - "/models/gemma-4-E2B-it-UD-Q4_K_XL.gguf"
       - "--mmproj"
       - "/mmproj/mmproj.gguf"
-      - "-c"
-      - "8192"
+      - "--image-max-tokens"
+      - "2240"
       - "-b"
-      - "2048"
+      - "512"
       - "-ub"
       - "512"
       - "-ngl"
-      - "999"
+      - "28"
+      - "--fit"
+      - "on"
+      - "--fit-target"
+      - "3584"
       - "--flash-attn"
       - "on"
       - "--cache-type-k"
-      - "q8_0"
+      - "q4_0"
       - "--cache-type-v"
-      - "q8_0"
+      - "q4_0"
       - "--no-mmap"
       - "-dio"
       - "--backend-sampling"
@@ -208,16 +210,9 @@ services:
       - "-np"
       - "1"
       - "--reasoning-budget"
-      - "2048"
+      - "-1"
       - "--chat-template-kwargs"
       - "{\"enable_thinking\":true}"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     networks:
       - aiot_net
 
@@ -434,8 +429,8 @@ services:
   # --------------------------------------------------
   n8n:
     build:
-      context: ./n8n
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: n8n/Dockerfile
     image: aiot-n8n:latest
     container_name: n8n
     environment:
@@ -449,9 +444,13 @@ services:
       - N8N_EXECUTIONS_DATA_PRUNE=true
       - N8N_EXECUTIONS_DATA_MAX_AGE=168
       - N8N_EXECUTIONS_PRUNE_INTERVAL=60
-      - N8N_ENDPOINT_WEBHOOK=run
+      - NODE_OPTIONS=--max-old-space-size=12288
+      - NODE_PATH=/usr/local/lib/node_modules/n8n/node_modules
       - NODES_EXCLUDE=[]
-      - NODE_FUNCTION_ALLOW_EXTERNAL=langchain,@langchain/*
+      - NODE_FUNCTION_ALLOW_BUILTIN=child_process,fs,path
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+      - N8N_ENDPOINT_WEBHOOK=run
     ports:
       - "5678:5678"
     volumes:
@@ -585,7 +584,7 @@ services:
   #     - aiot_net
 
   # --------------------------------------------------
-  # TTS: Fish Audio (HTTP inference server - CPU mode)
+  # TTS: Fish Audio (HTTP inference server - CUDA mode)
   # --------------------------------------------------
   egtts:
     build:
@@ -611,33 +610,77 @@ services:
       - aiot_net
 
   fish-speech:
-    image: fishaudio/fish-speech:server-cpu
+    image: fishaudio/fish-speech:v1.5.0
     container_name: fish-speech
     restart: unless-stopped
-    ports:
-      - "8086:8080"          # Fish Audio API server
-    command: 
-      - "--device"
-      - "cpu"
+    entrypoint: ["/bin/bash", "/fix/entrypoint-fix.sh"]
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTORCH_NVML_BASED_CUDA_CHECK=1
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
+      - PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:128,expandable_segments:True
+      - TORCH_CUDA_ALLOC_MAX_FRACTION=0.35
+    command:
+      - "--listen"
+      - "0.0.0.0:8080"
+      - "--llama-checkpoint-path"
+      - "checkpoints/fish-speech-1.5"
+      - "--decoder-checkpoint-path"
+      - "checkpoints/fish-speech-1.5/firefly-gan-vq-fsq-8x1024-21hz-generator.pth"
+      - "--decoder-config-name"
+      - "firefly_gan_vq"
+      - "--half"
+      - "--compile"
       - "--workers"
       - "1"
-      - "--max-text-length"
-      - "200"
+    ports:
+      - "8086:8080"
     volumes:
-      - ./fish-speech/checkpoints:/app/checkpoints
-      - ./fish-speech/references:/app/references
-    environment:
-      - COMPILE=0                                                  # torch.compile not supported on CPU
-      - OMP_NUM_THREADS=16                                         # Use all 16 CPU cores
-      - TORCH_NUM_THREADS=16                                       # PyTorch uses all available cores
-      - TORCH_NUM_INTEROP_THREADS=4                                # Inter-op threading
-      - MKL_NUM_THREADS=16                                         # Intel MKL uses all cores
-      - OPENBLAS_NUM_THREADS=16                                    # OpenBLAS uses all cores
-      - LLAMA_CHECKPOINT_PATH=checkpoints/openaudio-s1-mini        # Path to model weights
-      - DECODER_CHECKPOINT_PATH=checkpoints/openaudio-s1-mini/codec.pth
-      - DECODER_CONFIG_NAME=modded_dac_vq
+      - ./fish-speech/references:/opt/fish-speech/references
+      - ./fish-speech/entrypoint-fix.sh:/fix/entrypoint-fix.sh:ro
     networks:
       - aiot_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
+  # --------------------------------------------------
+  # TTS: OmniVoice (GGML/CUDA, voice design + cloning)
+  # --------------------------------------------------
+  omnivoice-service:
+    build:
+      context: .
+      dockerfile: omnivoice-service/Dockerfile
+    container_name: omnivoice-service
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - GGML_BACKEND=CUDA0
+      - OMNIVOICE_MODEL=/models/omnivoice-base-Q8_0.gguf
+      - OMNIVOICE_CODEC=/models/omnivoice-tokenizer-Q8_0.gguf
+      - OMNIVOICE_DEFAULT_LANG=English
+    ports:
+      - "5008:5008"
+    volumes:
+      - ./models/omnivoice:/models:ro
+      - ./speaker_reference.wav:/references/speaker_reference.wav:ro
+    networks:
+      - aiot_net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5008/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
 
   # --------------------------------------------------
   # Audio Playback Service (PulseAudio / PipeWire)
